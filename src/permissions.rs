@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+
+use crate::acp::PermissionOption;
 
 use crate::config::{save_permissions, AgentConfig};
 use crate::harness::Harness;
@@ -59,10 +61,12 @@ impl Store {
 
     pub fn candidate(&self, tool_call: &Value) -> Option<Approval> {
         if self.harness.approves_tool_names() {
-            let name = tool_call.pointer("/_meta/toolName")?.as_str()?;
-            if name.is_empty() {
-                return None;
-            }
+            // Prefer the standard tool name. Older adapters send only `_meta.toolName`.
+            let name = [tool_call.get("name"), tool_call.pointer("/_meta/toolName")]
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|name| !name.is_empty())?;
             return Some(Approval {
                 harness: self.harness.id().to_owned(),
                 label: name.to_owned(),
@@ -127,53 +131,55 @@ impl Store {
         Ok(())
     }
 
-    pub fn options(&self, options: &[Value], candidate: &Approval) -> Vec<Value> {
+    pub fn options(
+        &self,
+        options: &[PermissionOption],
+        candidate: &Approval,
+    ) -> Vec<PermissionOption> {
         let mut choices = options
             .iter()
             .filter_map(|option| {
-                let mut option = option.clone();
-                if option["kind"] == "allow_always" {
-                    let session = self.harness.always_allow_is_session_only()
-                        || option["optionId"]
-                            .as_str()
-                            .is_some_and(|id| id.to_lowercase().contains("session"))
-                        || option["name"]
-                            .as_str()
-                            .is_some_and(|name| name.to_lowercase().contains("session"));
-                    if !session {
-                        return None;
-                    }
-                    option["name"] = "allow for this session".into();
+                if option.kind != "allow_always" {
+                    return Some(option.clone());
                 }
-                Some(option)
+                let session = self.harness.always_allow_is_session_only()
+                    || option.id.to_lowercase().contains("session")
+                    || option.label.to_lowercase().contains("session");
+                session.then(|| PermissionOption {
+                    label: "allow for this session".into(),
+                    ..option.clone()
+                })
             })
             .collect::<Vec<_>>();
         let label = match candidate.scope {
             Scope::Tool { .. } => "always allow",
             Scope::Request { .. } => "always allow this exact request",
         };
-        choices.push(json!({"optionId": REMEMBER, "kind": "allow_always", "name": label}));
+        choices.push(PermissionOption {
+            id: REMEMBER.into(),
+            kind: "allow_always".into(),
+            label: label.into(),
+        });
         choices
     }
 }
 
 // Saved approvals use a one-time response, so revoking a saved rule takes effect
 // on the next request instead of leaving an extra approval cached in the harness.
-pub fn allow_once(options: &[Value]) -> Option<&str> {
-    let mut allowed = options
-        .iter()
-        .filter(|option| option["kind"] == "allow_once");
+pub fn allow_once(options: &[PermissionOption]) -> Option<&str> {
+    let mut allowed = options.iter().filter(|option| option.kind == "allow_once");
     let option = allowed.next()?;
     if allowed.next().is_some() {
         return None;
     }
-    option["optionId"].as_str()
+    Some(&option.id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::harness::get;
+    use serde_json::json;
 
     #[test]
     fn saved_rules_survive_reload_and_stay_with_their_agent_and_harness() {
@@ -234,18 +240,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_approvals_prefer_the_standard_name() {
+        let store = Store::new(Path::new("unused"), get("pi").unwrap());
+        let name = |call: Value| match store.candidate(&call).map(|rule| rule.scope) {
+            Some(Scope::Tool { name }) => Some(name),
+            _ => None,
+        };
+        assert_eq!(
+            name(json!({"name": "read", "_meta": {"toolName": "bash"}})).as_deref(),
+            Some("read")
+        );
+        assert_eq!(
+            name(json!({"name": "", "_meta": {"toolName": "bash"}})).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(name(json!({"name": null})), None);
+        let exact = Store::new(Path::new("unused"), get("codex").unwrap());
+        assert!(exact
+            .candidate(&json!({"name": "bash", "title": "bash"}))
+            .is_none());
+    }
+
+    #[test]
     fn session_and_permanent_choices_are_separate() {
         let store = Store::new(Path::new("unused"), get("pi").unwrap());
         let candidate = store
             .candidate(&json!({"_meta": {"toolName": "bash"}}))
             .unwrap();
+        let option = |id: &str, kind: &str, label: &str| PermissionOption {
+            id: id.into(),
+            kind: kind.into(),
+            label: label.into(),
+        };
         let options = vec![
-            json!({"optionId": "once", "kind": "allow_once", "name": "Allow once"}),
-            json!({"optionId": "allow_always", "kind": "allow_always", "name": "Always allow bash"}),
+            option("once", "allow_once", "Allow once"),
+            option("allow_always", "allow_always", "Always allow bash"),
         ];
         let choices = store.options(&options, &candidate);
-        assert_eq!(choices[1]["name"], "allow for this session");
-        assert_eq!(choices[2]["optionId"], REMEMBER);
+        assert_eq!(choices[1].label, "allow for this session");
+        assert_eq!(choices[2].id, REMEMBER);
         assert_eq!(allow_once(&options), Some("once"));
         assert_eq!(allow_once(&[options[0].clone(), options[0].clone()]), None);
         assert_eq!(allow_once(&[options[1].clone()]), None);

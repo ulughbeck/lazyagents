@@ -1,5 +1,6 @@
 mod commands;
 mod editor;
+mod elicitation;
 mod input;
 mod layout;
 mod output;
@@ -15,16 +16,19 @@ use chrono::{Datelike, Local};
 use inquire::{InquireError, Select};
 use tokio::signal;
 
-use self::input::{ChatHeader, Input};
-use crate::acp::{Client, ConfigKind, PermissionOption, PromptTimeout, StreamEvent};
+use self::input::{ChatHeader, ChatInput, Input};
+use crate::acp::{
+    Client, ConfigKind, ConfigOption, ConfigValue, Elicitation, ElicitationAnswer, Handler, Notice,
+    PermissionOption, PermissionRequest, PromptTimeout, StreamEvent,
+};
 use crate::config::{paths, AgentConfig};
 use crate::harness;
 use crate::mcp;
 use crate::session::{Role, SessionEntry, SessionLog, SessionSummary};
 
 use self::output::{
-    compact_line, detail_lines, display_width, interactive, print_colored, render_history,
-    render_user_prompt, TurnDisplay, LIGHT_GRAY,
+    compact_line, compaction_line, detail_lines, display_width, interactive, notice_line,
+    print_colored, render_history, render_user_prompt, TurnDisplay, LIGHT_GRAY,
 };
 
 pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
@@ -42,6 +46,7 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
             config.harness = selected.harness;
             config.model = None;
             config.thinking = None;
+            config.model_config.clear();
         }
         Some(selected.id)
     } else {
@@ -62,6 +67,7 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
             config.thinking.as_deref(),
         )
         .await?;
+        apply_model_config(&mut client, &config.model_config).await?;
     }
     let header = chat_header(&root, &config, &client)?;
     let header = if interactive() && history.is_empty() {
@@ -76,19 +82,12 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
     } else {
         Vec::new()
     };
-    let input = self::input::ChatInput::new(prompt_history, root.clone(), header);
+    let input = ChatInput::new(prompt_history, root.clone(), header);
     let mut log = None;
 
     loop {
-        let next = if interactive() {
-            // The editor restores terminal mode before returning an interrupt.
-            input.read_line().await?
-        } else {
-            tokio::select! {
-                result = input.read_line() => result?,
-                _ = signal::ctrl_c() => Input::Eof,
-            }
-        };
+        let next = read_input(&input, &mut client, log.as_mut()).await?;
+        input.flush_lines()?;
         let prompt = match next {
             Input::Line(prompt) => prompt,
             Input::Interrupted => continue,
@@ -131,6 +130,41 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
     }
 }
 
+/// Waits for user input and handles agent messages that arrive meanwhile.
+async fn read_input(
+    input: &ChatInput,
+    client: &mut Client,
+    mut log: Option<&mut SessionLog>,
+) -> Result<Input> {
+    let read = input.read_line();
+    tokio::pin!(read);
+    // Piped chat stops at Ctrl-C. The editor reads Ctrl-C as a key instead.
+    let ctrl_c = signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut listening = true;
+    loop {
+        for notice in client.take_notices() {
+            input.show(notice_line(&notice));
+        }
+        input.set_agent_commands(client.commands());
+        let message = tokio::select! {
+            result = &mut read => return result,
+            _ = &mut ctrl_c, if !interactive() => return Ok(Input::Eof),
+            message = client.next_message(), if listening => message,
+        };
+        let idle = Idle {
+            log: log.as_deref_mut(),
+            input,
+        };
+        let handled = match message {
+            Ok(message) => client.handle_idle(message, idle).await,
+            Err(error) => Err(error),
+        };
+        // Stop listening on a broken connection. The next prompt reports it.
+        listening = handled.is_ok();
+    }
+}
+
 async fn start_client(
     root: &Path,
     config: &AgentConfig,
@@ -139,7 +173,8 @@ async fn start_client(
     let agent_paths = paths(root);
     let soul = fs::read_to_string(&agent_paths.soul)
         .with_context(|| format!("could not read {}", agent_paths.soul.display()))?;
-    let launch = harness::launch(root, &config.harness, &runtime_instruction(&soul))?;
+    let mut launch = harness::launch(root, &config.harness, &runtime_instruction(&soul))?;
+    launch.elicitation = interactive();
     let servers = mcp::load(&agent_paths.mcp)?;
     let spinner = crate::progress::start(format!(
         "Starting {}...",
@@ -186,9 +221,11 @@ async fn run_command(
             let thinking = client
                 .select_config_option(ConfigKind::Thinking)
                 .map(|option| option.current_value.clone());
+            let model_config = client.model_config_values();
             let mut fresh = start_client(root, config, None).await?;
             apply_selection(&mut fresh, ConfigKind::Model, model.as_deref()).await?;
             apply_selection(&mut fresh, ConfigKind::Thinking, thinking.as_deref()).await?;
+            apply_model_config(&mut fresh, &model_config).await?;
             client.close().await;
             *client = fresh;
             if interactive() {
@@ -209,11 +246,7 @@ async fn run_command(
                 if error.downcast_ref::<crate::acp::ProtocolError>().is_none() {
                     return Err(error);
                 }
-                print_colored(
-                    true,
-                    "31",
-                    &format!("{}\n", client.friendly_error(&error, "")),
-                );
+                print_colored(true, "31", &format!("{}\n", client.friendly_error(&error)));
             }
         }
     }
@@ -227,26 +260,15 @@ async fn run_turn(
     prompt: &str,
     config: &AgentConfig,
 ) -> Result<()> {
-    let mut system_error = String::new();
     let mut display = TurnDisplay::new();
     let turn_input = crate::prompts::CancellationInput::new()?;
     display.start_waiting();
     let answer = tokio::select! {
         biased;
-        result = client.prompt_with_timeout(prompt, |event| {
-            log.stream(&event)?;
-            if let StreamEvent::SystemError(text) = &event {
-                system_error.push_str(text);
-                return Ok(None);
-            }
-            if matches!(&event, StreamEvent::PermissionRequest { .. }) {
-                turn_input.pause()?;
-                let result = display.handle(event, permission_selection);
-                turn_input.resume()?;
-                result
-            } else {
-                display.handle(event, permission_selection)
-            }
+        result = client.prompt_with_timeout(prompt, Turn {
+            log: &mut *log,
+            display: &mut display,
+            input: Some(&turn_input),
         }, Some(Duration::from_secs(config.idle_timeout.get()))) => Some(result),
         result = turn_input.cancelled(false) => {
             result?;
@@ -263,9 +285,10 @@ async fn run_turn(
     });
     if interrupted {
         let cancelled = client
-            .cancel_prompt(|event| {
-                log.stream(&event)?;
-                display.handle(event, permission_selection)
+            .cancel_prompt(Turn {
+                log: &mut *log,
+                display: &mut display,
+                input: None,
             })
             .await;
         display.finish();
@@ -286,10 +309,10 @@ async fn run_turn(
     let Some(Err(error)) = answer else {
         return log.append(&SessionEntry::TurnEnd);
     };
-    let friendly = client.friendly_error(&error, &system_error);
+    let friendly = client.friendly_error(&error);
     log.append(&SessionEntry::Error {
         message: friendly.clone(),
-        detail: format!("{error:#}\n{system_error}"),
+        detail: format!("{error:#}"),
         diagnostics: client.diagnostics(),
     })?;
     log.append(&SessionEntry::TurnEnd)?;
@@ -308,6 +331,75 @@ async fn run_turn(
     }
     client.close().await;
     Err(error)
+}
+
+/// Logs and shows the events of one turn.
+struct Turn<'a> {
+    log: &'a mut SessionLog,
+    display: &'a mut TurnDisplay,
+    /// Paused while the user answers a permission request or a form.
+    input: Option<&'a crate::prompts::CancellationInput>,
+}
+
+impl Handler for Turn<'_> {
+    fn event(&mut self, event: StreamEvent) -> Result<()> {
+        self.log.stream(&event)?;
+        self.display.handle(event)
+    }
+
+    fn notice(&mut self, notice: Notice) -> Result<()> {
+        self.display.notice(&notice)
+    }
+
+    fn permission(&mut self, request: &PermissionRequest) -> Result<Option<String>> {
+        self.log
+            .stream(&StreamEvent::PermissionRequest(request.clone()))?;
+        if let Some(input) = self.input {
+            input.pause()?;
+        }
+        let selected = self.display.permission(request, permission_selection);
+        if let Some(input) = self.input {
+            input.resume()?;
+        }
+        selected
+    }
+
+    fn elicitation(&mut self, request: &Elicitation) -> Result<ElicitationAnswer> {
+        self.display.pause()?;
+        if let Some(input) = self.input {
+            input.pause()?;
+        }
+        let answer = elicitation::ask(request);
+        if let Some(input) = self.input {
+            input.resume()?;
+        }
+        answer
+    }
+}
+
+/// Shows and logs what the agent sends between turns.
+struct Idle<'a> {
+    log: Option<&'a mut SessionLog>,
+    input: &'a ChatInput,
+}
+
+impl Handler for Idle<'_> {
+    fn event(&mut self, event: StreamEvent) -> Result<()> {
+        // Other events belong to a turn.
+        let StreamEvent::Compaction(end) = &event else {
+            return Ok(());
+        };
+        self.input.show(compaction_line(end));
+        if let Some(log) = &mut self.log {
+            log.stream(&event)?;
+        }
+        Ok(())
+    }
+
+    fn notice(&mut self, notice: Notice) -> Result<()> {
+        self.input.show(notice_line(&notice));
+        Ok(())
+    }
 }
 
 fn permission_selection(
@@ -506,6 +598,14 @@ fn save_model(client: &Client, root: &Path, harness: &str) -> Result<()> {
                 .map(|option| serde_json::Value::String(option.current_value.clone()))
                 .unwrap_or_default();
         }
+        let model_config = client.model_config_values();
+        if model_config.is_empty() {
+            if let Some(config) = config.as_object_mut() {
+                config.remove("model_config");
+            }
+        } else {
+            config["model_config"] = serde_json::to_value(model_config)?;
+        }
         Ok(())
     })
 }
@@ -523,37 +623,38 @@ fn print_status(client: &Client, root: &Path, harness: &str) -> Result<()> {
             .unwrap_or("default"),
         config.permission_mode
     );
+    for option in client.model_config_options() {
+        text.push_str(&format!(
+            "{}: {}\n",
+            option.name().to_lowercase(),
+            option.current_label()
+        ));
+    }
     if let Some((package, version)) = harness::installed_adapter(root, harness::get(harness)?) {
         let version = version.as_deref().unwrap_or("unknown");
         text.push_str(&format!("adapter: {package} {version}\n"));
     }
-    if let Some(usage) = &client.context_usage {
-        if let (Some(used), Some(size)) = (usage["used"].as_u64(), usage["size"].as_u64()) {
-            text.push_str(&format!("context: {used} / {size} tokens\n"));
-        }
-        if let (Some(cost), Some(currency)) = (
-            usage
-                .pointer("/cost/amount")
-                .and_then(serde_json::Value::as_f64),
-            usage
-                .pointer("/cost/currency")
-                .and_then(serde_json::Value::as_str),
-        ) {
-            text.push_str(&format!("cost: {cost:.4} {currency}\n"));
+    if let Some(usage) = client.context_usage() {
+        text.push_str(&format!(
+            "context: {} / {} tokens\n",
+            usage.used, usage.size
+        ));
+        if let Some(cost) = &usage.cost {
+            text.push_str(&format!("cost: {:.4} {}\n", cost.amount, cost.currency));
         }
     }
-    if let Some(usage) = &client.usage {
-        for (key, label) in [
-            ("inputTokens", "input tokens"),
-            ("outputTokens", "output tokens"),
-            ("totalTokens", "total tokens"),
+    if let Some(usage) = client.usage() {
+        for (count, label) in [
+            (usage.input_tokens, "input tokens"),
+            (usage.output_tokens, "output tokens"),
+            (usage.total_tokens, "total tokens"),
         ] {
-            if let Some(count) = usage[key].as_u64() {
+            if let Some(count) = count {
                 text.push_str(&format!("{label}: {count}\n"));
             }
         }
     }
-    if client.usage.is_none() && client.context_usage.is_none() {
+    if client.usage().is_none() && client.context_usage().is_none() {
         text.push_str("usage: not reported by harness\n");
     }
     print_colored(interactive(), LIGHT_GRAY, &text);
@@ -565,21 +666,39 @@ async fn change_model(client: &mut Client, root: &Path, harness: &str) -> Result
         return Ok(());
     }
     save_model(client, root, harness)?;
-    change_setting(client, ConfigKind::Thinking).await?;
-    save_model(client, root, harness)?;
-    print_colored(
-        true,
-        LIGHT_GRAY,
-        &format!(
-            "Model: {} · Reasoning: {}\n",
-            client
-                .current_config_label(ConfigKind::Model)
-                .unwrap_or("default"),
-            client
-                .current_config_label(ConfigKind::Thinking)
-                .unwrap_or("default"),
-        ),
+    if change_setting(client, ConfigKind::Thinking).await? {
+        save_model(client, root, harness)?;
+        // Each answer can change the options, so ask from the latest list.
+        let mut asked = Vec::new();
+        while let Some(option) = client
+            .model_config_options()
+            .into_iter()
+            .find(|option| !asked.iter().any(|id| id == option.id()))
+            .cloned()
+        {
+            asked.push(option.id().to_owned());
+            let Some(value) = choose_model_config(&option)? else {
+                break;
+            };
+            if value != option.value() {
+                client.set_config_option(option.id(), value).await?;
+            }
+            save_model(client, root, harness)?;
+        }
+    }
+    let mut summary = format!(
+        "Model: {} · Reasoning: {}",
+        client
+            .current_config_label(ConfigKind::Model)
+            .unwrap_or("default"),
+        client
+            .current_config_label(ConfigKind::Thinking)
+            .unwrap_or("default"),
     );
+    for option in client.model_config_options() {
+        summary.push_str(&format!(" · {}: {}", option.name(), option.current_label()));
+    }
+    print_colored(true, LIGHT_GRAY, &format!("{summary}\n"));
     Ok(())
 }
 
@@ -609,9 +728,32 @@ async fn change_setting(client: &mut Client, kind: ConfigKind) -> Result<bool> {
             Err(error) => return Err(error.into()),
         };
     if selected.value != current {
-        client.set_config_option(&id, &selected.value).await?;
+        client
+            .set_config_option(&id, ConfigValue::Select(selected.value))
+            .await?;
     }
     Ok(true)
+}
+
+/// Asks for a `model_config` value. Returns `None` when the user cancels.
+fn choose_model_config(option: &ConfigOption) -> Result<Option<ConfigValue>> {
+    let label = format!("Select {}", option.name().to_lowercase());
+    let selected = match option {
+        ConfigOption::Select(option) => crate::prompts::select(
+            Select::new(&label, option.choices.clone()).with_starting_cursor(option.cursor()),
+        )
+        .map(|choice| ConfigValue::Select(choice.value)),
+        ConfigOption::Boolean(option) => crate::prompts::select(
+            Select::new(&label, vec!["yes", "no"])
+                .with_starting_cursor(usize::from(!option.current_value)),
+        )
+        .map(|choice| ConfigValue::Boolean(choice == "yes")),
+    };
+    match selected {
+        Ok(value) => Ok(Some(value)),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn apply_selection(
@@ -626,6 +768,20 @@ async fn apply_selection(
                 ConfigKind::Thinking => "reasoning level",
             };
             eprintln!("warning: saved {name} {selection:?} is unavailable; using the default");
+        }
+    }
+    Ok(())
+}
+
+async fn apply_model_config(
+    client: &mut Client,
+    values: &std::collections::BTreeMap<String, ConfigValue>,
+) -> Result<()> {
+    for (id, value) in values {
+        if !client.set_model_config(id, value).await? {
+            eprintln!(
+                "warning: saved model setting {id:?} {value} is unavailable; using the default"
+            );
         }
     }
     Ok(())
@@ -664,7 +820,7 @@ mod tests {
         let error = anyhow::anyhow!("ACP error -32603: Internal error");
         let system_error = "[SYSTEM_ERROR] Internal error\nYou've hit your usage limit. Upgrade or try again at 7:35 PM.";
         assert_eq!(
-            crate::acp::friendly_error("Codex", &error, system_error, &[]),
+            crate::acp::friendly_error("Codex", &error, &[system_error.to_owned()]),
             "Usage limit reached. Try again at 7:35 PM."
         );
     }
@@ -673,12 +829,7 @@ mod tests {
     fn hides_unknown_acp_details() {
         let error = anyhow::anyhow!("ACP error -32603: Internal error");
         assert_eq!(
-            crate::acp::friendly_error(
-                "Claude Code",
-                &error,
-                "stack trace",
-                &["adapter details".into()]
-            ),
+            crate::acp::friendly_error("Claude Code", &error, &["adapter details".into()]),
             "Claude Code could not complete the request. Try again."
         );
     }

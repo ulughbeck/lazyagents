@@ -1,13 +1,12 @@
-use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::config::paths;
 
 use super::{
-    link_authentication, AdapterSpec, Authentication, Harness, LaunchContext, LaunchOptions,
+    link_file, owner_directory, AdapterSpec, Authentication, Harness, LaunchContext, LaunchOptions,
 };
 
 pub static PI: Pi = Pi;
@@ -30,7 +29,8 @@ impl Harness for Pi {
     fn adapter(&self) -> Option<AdapterSpec> {
         Some(AdapterSpec {
             package: "@automatalabs/pi-acp",
-            min_version: "0.8.0",
+            min_version: "0.9.4",
+            next_major: "1.0.0",
             binary: "pi-acp",
         })
     }
@@ -57,13 +57,13 @@ impl Harness for Pi {
         fs::create_dir_all(&agent_dir)?;
         fs::create_dir_all(&private_home)?;
         fs::create_dir_all(&session_dir)?;
-        let source_agent_dir = env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi/agent")));
-        let authentication = source_agent_dir
-            .as_ref()
-            .map(|directory| directory.join("auth.json"));
-        link_authentication(authentication, &agent_dir.join("auth.json"))?;
+        let source_agent_dir = owner_directory("PI_CODING_AGENT_DIR", ".pi/agent");
+        for file in ["auth.json", "models.json"] {
+            let source = source_agent_dir
+                .as_ref()
+                .map(|directory| directory.join(file));
+            link_file(source, &agent_dir.join(file))?;
+        }
         if let Some(source) = source_agent_dir {
             copy_model_catalog(
                 &source.join("models-store.json"),
@@ -172,5 +172,6 @@ mod tests {
             "You are a researcher.\n"
         );
         assert!(options.session_meta.is_none());
+        assert!(options.system_prompt.is_none());
     }
 }

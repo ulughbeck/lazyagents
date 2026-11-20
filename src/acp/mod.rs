@@ -1,17 +1,21 @@
+mod capabilities;
+mod commands;
 mod config;
+mod elicitation;
 mod error;
 mod events;
 mod requests;
 #[cfg(test)]
 mod tests;
 mod transport;
+mod usage;
 
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -19,27 +23,40 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::harness::Launch;
-pub use config::{ConfigKind, SelectConfigOption};
+use capabilities::Capabilities;
+pub use commands::AgentCommand;
+pub use config::{ConfigKind, ConfigOption, ConfigValue};
+pub use elicitation::{Choice, Elicitation, ElicitationAnswer, ElicitationOutcome, Field, Input};
 pub use error::{friendly_error, PromptTimeout, ProtocolError};
-use events::Updates;
-pub use events::{StreamEvent, ToolStatus};
+pub use events::{
+    CompactionEnd, Handler, Notice, PermissionRequest, Severity, StreamEvent, ToolStatus,
+};
+use events::{Compactions, Updates};
 pub use requests::PermissionOption;
 use transport::capture_stderr;
+pub use usage::{ContextUsage, Usage};
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Client {
-    pub usage: Option<Value>,
-    pub context_usage: Option<Value>,
+    usage: Option<Usage>,
+    context_usage: Option<ContextUsage>,
+    capabilities: Capabilities,
     permissions: Option<crate::permissions::Store>,
+    /// Forms and links were advertised in `initialize`.
+    elicitation: bool,
     child: Child,
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     pending_prompt: Option<u64>,
     session_id: String,
-    config_options: Vec<SelectConfigOption>,
+    config_options: Vec<ConfigOption>,
+    commands: Vec<AgentCommand>,
+    compactions: Compactions,
+    /// Notices that arrived during control requests.
+    notices: Vec<Notice>,
     runtime_name: &'static str,
     closed: bool,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
@@ -80,7 +97,9 @@ impl Client {
         let mut client = Self {
             usage: None,
             context_usage: None,
+            capabilities: Capabilities::default(),
             permissions: None,
+            elicitation: launch.elicitation,
             child,
             input,
             output,
@@ -88,38 +107,59 @@ impl Client {
             pending_prompt: None,
             session_id: String::new(),
             config_options: Vec::new(),
+            commands: Vec::new(),
+            compactions: Compactions::default(),
+            notices: Vec::new(),
             runtime_name: launch.runtime_name,
             closed: false,
             diagnostics,
             stderr_task,
         };
 
+        let mut client_capabilities = json!({"session": {
+            "configOptions": {"boolean": {}}, "notices": {}, "compaction": {}
+        }});
+        if client.elicitation {
+            client_capabilities["elicitation"] = json!({"form": {}});
+        }
         let initialize = client
             .request(
                 "initialize",
                 json!({
-                    "protocolVersion": 1,
+                    "protocolVersion": capabilities::PROTOCOL_VERSION,
                     "clientInfo": {"name": "lazyagents", "version": env!("CARGO_PKG_VERSION")},
-                    "clientCapabilities": {}
+                    "clientCapabilities": client_capabilities
                 }),
             )
             .await
             .context("ACP initialization failed")?;
+        client.capabilities = Capabilities::parse(&initialize)?;
 
         let mut session_params = json!({"cwd": cwd, "mcpServers": mcp_servers});
         if let Some(meta) = launch.session_meta {
             session_params["_meta"] = meta;
         }
+        if let Some(text) = launch.system_prompt {
+            // Never start a session without the agent instructions.
+            if !client.capabilities.system_prompt() {
+                bail!(
+                    "the {} ACP adapter cannot receive the agent instructions; run `lazyagents repair` to update it",
+                    launch.runtime_name
+                );
+            }
+            session_params["systemPrompt"] =
+                json!({"mode": "append", "content": [{"type": "text", "text": text}]});
+        }
         let response = if let Some(session_id) = resume_session_id {
             session_params["sessionId"] = Value::String(session_id.to_owned());
-            let method = continuation_method(&initialize).context(
+            let method = client.capabilities.continuation_method().context(
                 "the selected harness does not support resuming persistent ACP sessions",
             )?;
             let response = match client.request(method, session_params.clone()).await
             {
                 Ok(response) => response,
                 Err(resume_error)
-                    if method == "session/resume" && supports_load_session(&initialize) =>
+                    if method == "session/resume" && client.capabilities.load_session() =>
                 {
                     client
                         .request("session/load", session_params)
@@ -152,7 +192,9 @@ impl Client {
                 .to_owned();
             response
         };
-        client.update_config_options(&response);
+        if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
+            client.set_config_options(options);
+        }
         Ok(client)
     }
 
@@ -160,19 +202,20 @@ impl Client {
         &self.session_id
     }
 
-    /// Stops an interrupted prompt and drains its response before another turn can start.
-    pub async fn cancel_prompt<F>(&mut self, on_event: F) -> Result<()>
-    where
-        F: FnMut(StreamEvent) -> Result<Option<String>>,
-    {
-        self.cancel_pending_prompt(&mut Updates::new(on_event))
-            .await
+    pub fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
     }
 
-    async fn cancel_pending_prompt<F>(&mut self, updates: &mut Updates<F>) -> Result<()>
-    where
-        F: FnMut(StreamEvent) -> Result<Option<String>>,
-    {
+    pub fn context_usage(&self) -> Option<&ContextUsage> {
+        self.context_usage.as_ref()
+    }
+
+    /// Stops an interrupted prompt and drains its response before another turn can start.
+    pub async fn cancel_prompt(&mut self, handler: impl Handler) -> Result<()> {
+        self.cancel_pending_prompt(&mut Updates::new(handler)).await
+    }
+
+    async fn cancel_pending_prompt<H: Handler>(&mut self, updates: &mut Updates<H>) -> Result<()> {
         let id = self
             .pending_prompt
             .context("the prompt was interrupted before it was sent; restart chat")?;
@@ -183,19 +226,7 @@ impl Client {
                 "params": {"sessionId": self.session_id}
             }))
             .await?;
-            loop {
-                let message = self.read().await?;
-                if message.get("method").is_some() && message.get("id").is_some() {
-                    self.handle_request(&message, updates, true).await?;
-                } else if message.get("method").and_then(Value::as_str) == Some("session/update") {
-                    if let Some(update) = message.pointer("/params/update") {
-                        updates.update(update)?;
-                    }
-                } else if message.get("id").and_then(Value::as_u64) == Some(id) {
-                    self.pending_prompt = None;
-                    return Ok(());
-                }
-            }
+            self.drain_cancelled(id, updates).await
         })
         .await
         .context("the agent did not stop within five seconds; restart chat")?
@@ -206,7 +237,7 @@ impl Client {
             return;
         }
         let session_id = self.session_id.clone();
-        if !session_id.is_empty() {
+        if !session_id.is_empty() && self.capabilities.close_session() {
             let _ = timeout(
                 Duration::from_secs(2),
                 self.request("session/close", json!({"sessionId": session_id})),
@@ -226,6 +257,11 @@ impl Client {
         self.stderr_task.abort();
     }
 
+    /// Notices that arrived while no turn was active, oldest first.
+    pub fn take_notices(&mut self) -> Vec<Notice> {
+        std::mem::take(&mut self.notices)
+    }
+
     pub fn diagnostics(&self) -> Vec<String> {
         self.diagnostics
             .lock()
@@ -233,46 +269,31 @@ impl Client {
             .unwrap_or_default()
     }
 
-    pub async fn prompt<F>(&mut self, text: &str, mut on_event: F) -> Result<String>
-    where
-        F: FnMut(StreamEvent) -> Result<Option<String>>,
-    {
-        let mut answer = String::new();
-        self.prompt_with_timeout(
-            text,
-            |event| {
-                if let StreamEvent::Assistant(text) = &event {
-                    answer.push_str(text);
-                }
-                on_event(event)
-            },
-            None,
-        )
-        .await?;
-        Ok(answer)
+    /// Sends a prompt and returns the complete assistant answer.
+    pub async fn prompt(&mut self, text: &str, handler: impl Handler) -> Result<String> {
+        self.prompt_with_timeout(text, handler, None).await
     }
 
-    pub async fn prompt_with_timeout<F>(
+    pub async fn prompt_with_timeout(
         &mut self,
         text: &str,
-        on_event: F,
+        handler: impl Handler,
         inactivity_timeout: Option<Duration>,
-    ) -> Result<()>
-    where
-        F: FnMut(StreamEvent) -> Result<Option<String>>,
-    {
-        let mut updates = Updates::new(on_event);
+    ) -> Result<String> {
+        let mut updates = Updates::new(handler);
         let session_id = self.session_id.clone();
-        self.request_with_timeout(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": text}]
-            }),
-            &mut updates,
-            inactivity_timeout,
-        )
-        .await?;
+        let id = self
+            .send_request(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": text}]
+                }),
+            )
+            .await?;
+        self.pending_prompt = Some(id);
+        self.await_response(id, &mut updates, inactivity_timeout)
+            .await?;
         updates.finish()
     }
 }
@@ -285,24 +306,4 @@ impl Drop for Client {
             let _ = self.child.start_kill();
         }
     }
-}
-
-fn continuation_method(initialize: &Value) -> Option<&'static str> {
-    if initialize
-        .pointer("/agentCapabilities/sessionCapabilities/resume")
-        .is_some_and(Value::is_object)
-    {
-        Some("session/resume")
-    } else if supports_load_session(initialize) {
-        Some("session/load")
-    } else {
-        None
-    }
-}
-
-fn supports_load_session(initialize: &Value) -> bool {
-    initialize
-        .pointer("/agentCapabilities/loadSession")
-        .and_then(Value::as_bool)
-        == Some(true)
 }

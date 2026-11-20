@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,6 +9,11 @@ use tokio::sync::oneshot;
 
 use super::editor::{Action, Editor};
 use super::layout::Display;
+use super::output::{print_line, Line};
+use crate::acp::AgentCommand;
+
+/// How often the editor checks for agent updates while it waits for a key.
+const LIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub const DARK_GRAY: &str = "38;5;242";
 
@@ -142,11 +147,21 @@ pub enum Input {
     Eof,
 }
 
+/// Agent updates for the editor. The editor owns the terminal while it reads,
+/// so it prints the lines itself.
+#[derive(Default)]
+struct Live {
+    commands: Vec<AgentCommand>,
+    revision: u64,
+    lines: Vec<Line>,
+}
+
 /// Reads only on request. Permission prompts retain exclusive terminal access
 /// between turns, and a blocked pipe read does not hold up Tokio shutdown.
 pub struct ChatInput {
     requests: mpsc::Sender<oneshot::Sender<Result<Input>>>,
     draft: Option<DraftWriter>,
+    live: Arc<Mutex<Live>>,
 }
 
 impl ChatInput {
@@ -155,9 +170,12 @@ impl ChatInput {
         let draft = (io::stdin().is_terminal() && io::stdout().is_terminal())
             .then(|| DraftWriter::new(root.clone()));
         let writer = draft.clone();
+        let live = Arc::new(Mutex::new(Live::default()));
+        let shared = Arc::clone(&live);
         std::thread::spawn(move || {
             let mut editor = None;
             let mut header = header;
+            let mut revision = 0;
             while let Ok(reply) = receiver.recv() {
                 let result = (|| -> Result<Input> {
                     if io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -171,7 +189,7 @@ impl ChatInput {
                             ));
                         }
                         let (editor, draft) = editor.as_mut().expect("editor initialized above");
-                        read_terminal(editor, draft, header.take())
+                        read_terminal(editor, draft, header.take(), &shared, &mut revision)
                     } else {
                         eprint!("> ");
                         io::stderr().flush()?;
@@ -189,7 +207,40 @@ impl ChatInput {
                 }
             }
         });
-        Self { requests, draft }
+        Self {
+            requests,
+            draft,
+            live,
+        }
+    }
+
+    /// Updates the agent commands in the `/` menu.
+    pub fn set_agent_commands(&self, commands: &[AgentCommand]) {
+        let mut live = self.live.lock().expect("live state lock");
+        if live.commands != commands {
+            live.commands = commands.to_vec();
+            live.revision += 1;
+        }
+    }
+
+    /// Shows a line from the agent. The editor prints it while it reads.
+    /// Piped chat prints it to stderr at once.
+    pub fn show(&self, line: Line) {
+        if self.draft.is_some() {
+            self.live.lock().expect("live state lock").lines.push(line);
+        } else {
+            print_line(false, &line);
+        }
+    }
+
+    /// Prints the lines that the editor did not print before it returned.
+    pub fn flush_lines(&self) -> Result<()> {
+        let lines = std::mem::take(&mut self.live.lock().expect("live state lock").lines);
+        for line in &lines {
+            print_line(true, line);
+        }
+        io::stdout().flush()?;
+        Ok(())
     }
 
     /// Clear only after the caller has saved the prompt or accepted a command.
@@ -234,10 +285,37 @@ impl Drop for TerminalMode {
     }
 }
 
+/// Applies new agent commands. Returns the lines to print and whether the
+/// visible menu changed.
+fn sync_live(live: &Mutex<Live>, editor: &mut Editor, revision: &mut u64) -> (String, bool) {
+    let mut live = live.lock().expect("live state lock");
+    let lines = std::mem::take(&mut live.lines)
+        .iter()
+        .map(|line| format!("\x1b[{}m{}\x1b[0m\r\n", line.color, line.text))
+        .collect();
+    if live.revision == *revision {
+        return (lines, false);
+    }
+    *revision = live.revision;
+    let before = editor.choices().len();
+    editor.set_agent_commands(&live.commands);
+    (lines, before > 0 || !editor.choices().is_empty())
+}
+
+fn next_event() -> io::Result<Option<Event>> {
+    if event::poll(LIVE_INTERVAL)? {
+        event::read().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn read_terminal(
     editor: &mut Editor,
     draft: &DraftWriter,
     header: Option<ChatHeader>,
+    live: &Mutex<Live>,
+    revision: &mut u64,
 ) -> Result<Input> {
     io::stdout().flush()?;
     let mut size = crossterm::terminal::size()?;
@@ -250,10 +328,18 @@ fn read_terminal(
     let _mode = TerminalMode::enter()?;
     let mut display = Display::new();
     let result = (|| {
-        display.draw(&mut io::stderr(), editor, size)?;
+        let (lines, _) = sync_live(live, editor, revision);
+        display.print_above(&mut io::stderr(), &lines, editor, size)?;
         loop {
-            let event = match event::read() {
-                Ok(event) => event,
+            let event = match next_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    let (lines, menu_changed) = sync_live(live, editor, revision);
+                    if !lines.is_empty() || menu_changed {
+                        display.print_above(&mut io::stderr(), &lines, editor, size)?;
+                    }
+                    continue;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     draft.flush(&editor.text)?;
                     display.finish(&mut io::stderr(), "", size)?;

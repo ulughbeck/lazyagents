@@ -28,7 +28,7 @@ lazyagents init
 lazyagents chat
 ```
 
-Setup asks for a harness, name, description, model, and reasoning level. It installs the latest release of the required adapter and generates `.agents/SOUL.md` automatically.
+Setup asks for a harness, name, description, model, and reasoning level. It installs the newest tested release of the required adapter and generates `.agents/SOUL.md` automatically.
 
 Existing `.agents` folders are supported. Setup preserves skills, sessions, MCP settings, and `.gitignore`. If `agent.json`, `SOUL.md`, or the launcher already exists, setup lists those files and asks before replacing them. Failed or cancelled setup restores those files.
 
@@ -50,11 +50,17 @@ Type `/` to see commands. Keep typing to filter and use the arrow keys to select
 
 | Command | Action |
 | --- | --- |
-| `/model` | Select model and reasoning level; save them for new sessions |
+| `/model` | Select model, reasoning level, and other model settings the harness offers; save them for new sessions |
 | `/permissions` | Select and save `ask for approval` or `full access` |
 | `/new` | Start an empty conversation with the current settings |
-| `/status` | Show session settings, adapter version, and usage reported by the harness |
+| `/status` | Show session settings, model settings, adapter version, and usage reported by the harness |
 | `/quit` | Exit chat |
+
+The menu also lists the commands that the harness offers, for example its skills. A local command wins when the names match. Chat sends a harness command as an ordinary prompt: `/name`, optionally followed by input. Tab adds a space after a command that takes input.
+
+Harness notices show as one line: gray for information, yellow for warnings, red for errors. They are not saved. When the harness compacts the context, chat shows one gray line. That line is saved and appears again when you resume the session.
+
+The harness can ask for input with a form during a turn; requests between turns are cancelled. A form asks one field at a time, then shows the answers: submit, change a field, or decline. Esc cancels the request, and Ctrl-C also stops the turn. Chat saves one line with the request and your choice, not your answers. Forms that use unsupported schema features are declined. Link requests are not supported.
 
 Unsent input is saved per agent and restored on the next launch. Tool output is shortened in chat; complete events are saved in `.agents/sessions/`.
 
@@ -67,6 +73,7 @@ Settings live in `.agents/agent.json`. Setup writes the initial configuration, a
 | `name`, `slug`, `description` | Agent identity and launcher name |
 | `harness` | `codex`, `claude`, `opencode`, or `pi` |
 | `model`, `thinking` | Default model and reasoning level for new sessions |
+| `model_config` | Other model settings for new sessions, by harness option id, for example `{"fast-mode": true}` |
 | `permission_mode` | `ask` or `full_access` |
 | `permissions` | Permanent tool approvals |
 | `idle_timeout` | Seconds without harness activity before cancelling a turn; defaults to `300` |
@@ -99,6 +106,17 @@ workspace/                  agent working directory
 
 The generated `.agents/.gitignore` excludes configuration, the system prompt, MCP settings, runtime files, and session logs. Skills remain available for version control.
 
+Each harness runs with its own configuration in `runtime/`. Only your sign-in and model provider settings come from your harness configuration. Chat reads them again on each start:
+
+| Harness | Provider settings |
+| --- | --- |
+| Claude Code | `apiKeyHelper` and `env` entries for endpoints, credentials, Bedrock, Vertex, Foundry, regions, and model names in `settings.json` |
+| Codex | `model_provider` (from the active profile if set), `model_providers`, and `openai_base_url` in `config.toml` |
+| OpenCode | `provider`, `providers`, `enabled_providers`, `disabled_providers`, and provider policies in `opencode.json` and `opencode.jsonc` |
+| Pi | `models.json` |
+
+MCP servers, plugins, memory, skills, and other settings are not carried over. With provider credentials in the shell or in these settings, setup does not ask you to sign in.
+
 ## MCP servers and skills
 
 Add MCP servers to `.agents/mcps.json`, which contains an empty array by default:
@@ -127,11 +145,11 @@ Put each skill at `.agents/skills/<name>/SKILL.md`. The selected harness handles
 
 ## Troubleshooting
 
-Run `lazyagents repair` in the agent folder to update its ACP adapter to the latest release. Repair prints the installed version, and `/status` shows it during chat. Chat does not update the adapter. If the installed adapter is older than the oldest supported version, chat stops and asks you to run repair. Interactive chat offers to install a missing adapter; for scripts, run repair first.
+Run `lazyagents repair` in the agent folder to update its ACP adapter to the newest tested release. Each adapter stays within its tested major version: Claude Code and Pi below 1.0.0, Codex below 3.0.0. Repair prints the installed version, and `/status` shows it during chat. Chat does not update the adapter. If the installed adapter is older than the oldest supported version, or cannot receive the agent instructions, chat stops and asks you to run repair. Interactive chat offers to install a missing adapter; for scripts, run repair first.
 
 ## Pipes
 
-Piped chat sends assistant output to stdout and diagnostics to stderr. It does not save drafts or load input history. Failed turns and inactivity timeouts return a nonzero exit code. Permission requests that require an interactive choice are cancelled. Ctrl-C stops the turn.
+Piped chat sends assistant output to stdout and diagnostics, notices, and compaction lines to stderr. It does not save drafts or load input history. Failed turns and inactivity timeouts return a nonzero exit code. Permission requests that require an interactive choice are cancelled. Chat does not offer forms or links to the harness. Ctrl-C stops the turn.
 
 ## Development
 

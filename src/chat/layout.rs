@@ -112,7 +112,8 @@ fn layout(editor: &Editor, size: (u16, u16)) -> Layout {
         Some(editor.cursor + prefix.len()),
     );
     let choices = editor.choices();
-    let menu_count = choices.len().min(height.saturating_sub(1));
+    // Agents can offer many commands. Selection scrolls the menu.
+    let menu_count = choices.len().min(height.saturating_sub(1)).min(8);
     let capacity = (height - menu_count).min(8);
     let start = input
         .cursor
@@ -218,6 +219,23 @@ impl Display {
         self.rows = layout.rows.len();
         self.cursor_row = layout.cursor.0;
         Ok(())
+    }
+
+    /// Prints complete lines where the editor was and draws it again below them.
+    /// Each line must end with `\r\n`.
+    pub fn print_above(
+        &mut self,
+        out: &mut impl Write,
+        lines: &str,
+        editor: &Editor,
+        size: (u16, u16),
+    ) -> io::Result<()> {
+        if !lines.is_empty() {
+            write!(out, "\x1b[?2026h\x1b[?25l")?;
+            self.clear(out, size.1)?;
+            write!(out, "{lines}")?;
+        }
+        self.draw(out, editor, size)
     }
 
     pub fn finish(&mut self, out: &mut impl Write, line: &str, size: (u16, u16)) -> io::Result<()> {
@@ -423,6 +441,26 @@ mod tests {
             .screen()
             .contents()
             .starts_with("Earlier output must stay intact"));
+    }
+
+    #[test]
+    fn lines_printed_above_the_editor_keep_the_draft_below_them() {
+        let mut terminal = vt100::Parser::new(24, 40, 100);
+        terminal.process(b"Earlier output\r\n");
+        let mut display = Display::new();
+        let mut editor = Editor::new(vec![], "/".into());
+        let mut bytes = vec![];
+        display.draw(&mut bytes, &editor, (40, 24)).unwrap();
+        editor.insert("mo");
+        display
+            .print_above(&mut bytes, "Context compacted\r\n", &editor, (40, 24))
+            .unwrap();
+        terminal.process(&bytes);
+        assert_eq!(
+            terminal.screen().contents(),
+            "Earlier output\nContext compacted\n> /mo\n> /model        select model and reasoni"
+        );
+        assert_eq!(terminal.screen().cursor_position(), (2, 5));
     }
 
     #[test]

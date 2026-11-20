@@ -1,11 +1,13 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
-use super::{Client, StreamEvent, Updates};
+use super::{Client, Handler, PermissionRequest, StreamEvent, Updates};
 use crate::harness::Harness;
+use crate::permissions::{Mode, Store, REMEMBER};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PermissionOption {
@@ -14,124 +16,153 @@ pub struct PermissionOption {
     pub label: String,
 }
 
+impl PermissionOption {
+    fn allows(&self) -> bool {
+        matches!(self.kind.as_str(), "allow_once" | "allow_always")
+    }
+}
+
+/// The `session/request_permission` params this client uses.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionParams {
+    #[serde(default)]
+    tool_call: Option<Value>,
+    options: Vec<Value>,
+}
+
 impl Client {
     pub fn remember_permissions(&mut self, root: &Path, harness: &'static dyn Harness) {
-        self.permissions = Some(crate::permissions::Store::new(root, harness));
+        self.permissions = Some(Store::new(root, harness));
     }
 
-    pub(super) async fn handle_request<F>(
+    pub(super) async fn handle_request<H: Handler>(
         &mut self,
-        request: &Value,
-        updates: &mut Updates<F>,
+        id: Value,
+        method: &str,
+        params: &RawValue,
+        updates: &mut Updates<H>,
         cancelled: bool,
-    ) -> Result<()>
-    where
-        F: FnMut(StreamEvent) -> Result<Option<String>>,
-    {
-        let id = request
-            .get("id")
-            .cloned()
-            .context("ACP request has no id")?;
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        if method != "session/request_permission" {
-            return self
-                .write(&json!({
+    ) -> Result<()> {
+        match method {
+            "session/request_permission" => {
+                self.handle_permission(id, params, updates, cancelled)
+                    .await
+            }
+            "elicitation/create" => {
+                self.handle_elicitation(id, params, updates, cancelled)
+                    .await
+            }
+            _ => {
+                self.write(&json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {"code": -32601, "message": format!("Unsupported ACP client method: {method}")}
                 }))
-                .await;
+                .await
+            }
         }
-
-        let title = request
-            .pointer("/params/toolCall/title")
-            .and_then(Value::as_str)
-            .unwrap_or("The agent wants to use a tool");
-        let options = request
-            .pointer("/params/options")
-            .and_then(Value::as_array)
-            .context("ACP permission request has no options")?;
-        let once = crate::permissions::allow_once(options);
-        let full_access = !cancelled
-            && self
-                .permissions
-                .as_ref()
-                .map(|store| store.mode())
-                .transpose()?
-                == Some(crate::permissions::Mode::FullAccess);
-        let candidate = if cancelled || once.is_none() {
-            None
-        } else {
-            self.permissions.as_ref().and_then(|store| {
-                request
-                    .pointer("/params/toolCall")
-                    .and_then(|call| store.candidate(call))
-            })
-        };
-        let remembered = match (&self.permissions, &candidate) {
-            (Some(store), Some(candidate)) => store.contains(candidate)?,
-            _ => false,
-        };
-        let choices = match (&self.permissions, &candidate) {
-            (Some(store), Some(candidate)) => store.options(options, candidate),
-            _ => options.clone(),
-        };
-        let automatic = if full_access {
-            options
-                .iter()
-                .find(|option| option["kind"] == "allow_once")
-                .and_then(|option| option["optionId"].as_str())
-                .map(str::to_owned)
-        } else if remembered {
-            once.map(str::to_owned)
-        } else {
-            None
-        };
-        let selected = if automatic.is_some() {
-            automatic
-        } else {
-            updates.emit(StreamEvent::PermissionRequest {
-                title: title.to_owned(),
-                tool_call: request.pointer("/params/toolCall").cloned(),
-                options: choices.iter().filter_map(permission_option).collect(),
-                cancelled,
-            })?
-        };
-        let mut selected = selected.filter(|_| !cancelled);
-        if selected.as_deref() == Some(crate::permissions::REMEMBER) {
-            selected = match (&self.permissions, candidate, once) {
-                (Some(store), Some(candidate), Some(once)) => {
-                    store.remember(candidate)?;
-                    Some(once.to_owned())
-                }
-                _ => None,
-            };
-        }
-        let allowed = selected.as_deref().is_some_and(|selected| {
-            options.iter().any(|option| {
-                option.get("optionId").and_then(Value::as_str) == Some(selected)
-                    && matches!(
-                        option.get("kind").and_then(Value::as_str),
-                        Some("allow_once" | "allow_always")
-                    )
-            })
-        });
-        updates.emit(StreamEvent::PermissionDecision {
-            title: title.to_owned(),
-            allowed,
-        })?;
-        let option_id = selected.filter(|selected| {
-            options.iter().any(|option| {
-                option.get("optionId").and_then(Value::as_str) == Some(selected.as_str())
-            })
-        });
-        let outcome = option_id.map_or_else(
-            || json!({"outcome": "cancelled"}),
-            |option_id| json!({"outcome": "selected", "optionId": option_id}),
-        );
-        self.write(&json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}}))
-            .await
     }
+
+    async fn handle_permission<H: Handler>(
+        &mut self,
+        id: Value,
+        params: &RawValue,
+        updates: &mut Updates<H>,
+        cancelled: bool,
+    ) -> Result<()> {
+        let Ok(params) = serde_json::from_str::<PermissionParams>(params.get()) else {
+            return self
+                .write(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "Invalid session/request_permission params"}
+                }))
+                .await;
+        };
+        let request = PermissionRequest {
+            title: params
+                .tool_call
+                .as_ref()
+                .and_then(|call| call.get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or("The agent wants to use a tool")
+                .to_owned(),
+            tool_call: params.tool_call,
+            options: params
+                .options
+                .iter()
+                .filter_map(permission_option)
+                .collect(),
+            cancelled,
+        };
+        let decision = decide(self.permissions.as_ref(), &request, updates);
+        let selected = decision
+            .as_ref()
+            .ok()
+            .and_then(Option::as_deref)
+            .and_then(|selected| request.options.iter().find(|option| option.id == selected));
+        let outcome = selected.map_or_else(
+            || json!({"outcome": "cancelled"}),
+            |option| json!({"outcome": "selected", "optionId": option.id}),
+        );
+        // Every request needs an answer, also when the decision failed.
+        self.write(&json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}}))
+            .await?;
+        let allowed = selected.is_some_and(PermissionOption::allows);
+        decision?;
+        updates.event(StreamEvent::PermissionDecision {
+            title: request.title,
+            allowed,
+        })
+    }
+}
+
+/// Answers from saved policy when possible and asks the user otherwise.
+/// Returns the selected option id, or `None` to cancel.
+fn decide<H: Handler>(
+    store: Option<&Store>,
+    request: &PermissionRequest,
+    updates: &mut Updates<H>,
+) -> Result<Option<String>> {
+    if request.cancelled {
+        updates.event(StreamEvent::PermissionRequest(request.clone()))?;
+        return Ok(None);
+    }
+    let Some(store) = store else {
+        return updates.permission(request);
+    };
+    if store.mode()? == Mode::FullAccess {
+        if let Some(option) = request
+            .options
+            .iter()
+            .find(|option| option.kind == "allow_once")
+        {
+            return Ok(Some(option.id.clone()));
+        }
+    }
+    let once = crate::permissions::allow_once(&request.options);
+    let saved = once.zip(
+        request
+            .tool_call
+            .as_ref()
+            .and_then(|call| store.candidate(call)),
+    );
+    let Some((once, candidate)) = saved else {
+        return updates.permission(request);
+    };
+    if store.contains(&candidate)? {
+        return Ok(Some(once.to_owned()));
+    }
+    let selected = updates.permission(&PermissionRequest {
+        options: store.options(&request.options, &candidate),
+        ..request.clone()
+    })?;
+    if selected.as_deref() == Some(REMEMBER) {
+        store.remember(candidate)?;
+        return Ok(Some(once.to_owned()));
+    }
+    Ok(selected)
 }
 
 fn permission_option(value: &Value) -> Option<PermissionOption> {

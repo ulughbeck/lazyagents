@@ -2,7 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::commands::{Command, CommandSpec, COMMANDS};
+use super::commands::{menu, Command, MenuEntry};
+use crate::acp::AgentCommand;
 
 pub(super) enum Action {
     None,
@@ -15,6 +16,7 @@ pub(super) struct Editor {
     pub text: String,
     pub cursor: usize,
     pub selected: usize,
+    commands: Vec<MenuEntry>,
     dismissed: bool,
     revision: u64,
     history: Vec<String>,
@@ -46,6 +48,7 @@ impl Editor {
             cursor: text.len(),
             text,
             selected: 0,
+            commands: menu(&[]),
             dismissed: false,
             revision: 0,
             history_index: history.len(),
@@ -57,7 +60,16 @@ impl Editor {
         }
     }
 
-    pub fn choices(&self) -> Vec<&'static CommandSpec> {
+    /// Replaces the agent commands in the `/` menu.
+    pub fn set_agent_commands(&mut self, commands: &[AgentCommand]) {
+        let commands = menu(commands);
+        if commands != self.commands {
+            self.commands = commands;
+            self.selected = 0;
+        }
+    }
+
+    pub fn choices(&self) -> Vec<&MenuEntry> {
         if self.search.is_some()
             || self.dismissed
             || !self.text.starts_with('/')
@@ -65,7 +77,7 @@ impl Editor {
         {
             return Vec::new();
         }
-        COMMANDS
+        self.commands
             .iter()
             .filter(|command| command.name.starts_with(&self.text))
             .collect()
@@ -368,17 +380,17 @@ impl Editor {
             self.insert("\n");
             return Action::Redraw;
         }
-        let choices = self.choices();
-        if !ctrl && !alt && !choices.is_empty() {
+        let count = self.choices().len();
+        if !ctrl && !alt && count > 0 {
             match key.code {
-                Up => self.selected = (self.selected + choices.len() - 1) % choices.len(),
-                Down => self.selected = (self.selected + 1) % choices.len(),
+                Up => self.selected = (self.selected + count - 1) % count,
+                Down => self.selected = (self.selected + 1) % count,
                 Esc => self.dismissed = true,
                 Tab => {
-                    let name = choices[self.selected].name;
-                    if self.text != name {
+                    let completion = self.choices()[self.selected].completion();
+                    if self.text != completion {
                         self.checkpoint();
-                        self.text = name.to_owned();
+                        self.text = completion;
                         self.changed();
                     }
                     self.cursor = self.text.len();
@@ -486,11 +498,10 @@ impl Editor {
     }
 
     pub fn submit(&mut self) -> String {
-        let selected = self
+        let line = self
             .choices()
             .get(self.selected)
-            .map(|choice| choice.command);
-        let line = selected.map_or_else(|| self.text.clone(), |command| command.name().to_owned());
+            .map_or_else(|| self.text.clone(), |choice| choice.name.clone());
         if !line.trim().is_empty()
             && Command::parse(line.trim()).is_none()
             && self.history.last() != Some(&line)
@@ -632,7 +643,7 @@ mod tests {
     fn command_selection_dismissal_and_submission() {
         use KeyCode::*;
         let mut editor = Editor::new(vec![], "/".into());
-        assert_eq!(editor.choices().len(), COMMANDS.len());
+        assert_eq!(editor.choices().len(), 5);
         key(&mut editor, Up, KeyModifiers::NONE);
         assert_eq!(editor.submit(), "/quit");
         editor.insert("/sta");

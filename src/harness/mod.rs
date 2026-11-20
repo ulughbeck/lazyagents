@@ -20,16 +20,31 @@ mod pi;
 #[derive(Clone, Copy)]
 pub struct AdapterSpec {
     pub package: &'static str,
-    /// The oldest release known to work. Setup and repair install the latest release.
+    /// The oldest tested release. Chat stops if the installed adapter is older.
     pub min_version: &'static str,
+    /// The first untested major release. Setup and repair install the newest
+    /// release from `min_version` up to this version.
+    pub next_major: &'static str,
     pub binary: &'static str,
+}
+
+impl AdapterSpec {
+    /// The npm package specification for the tested release range.
+    fn npm_package(&self) -> String {
+        format!(
+            "{}@>={} <{}",
+            self.package, self.min_version, self.next_major
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct Authentication {
     pub status_args: &'static [&'static str],
     pub login_args: &'static [&'static str],
-    pub api_key_variables: &'static [&'static str],
+    /// True when the shell or the owner's harness configuration already gives
+    /// credentials or a custom provider, so setup does not ask to sign in.
+    pub has_provider_credentials: fn() -> bool,
 }
 
 pub struct LaunchContext<'a> {
@@ -43,6 +58,8 @@ pub struct LaunchOptions {
     pub args: Vec<OsString>,
     pub env: BTreeMap<String, String>,
     pub session_meta: Option<Value>,
+    /// Instructions sent with the standard ACP `systemPrompt` field.
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -52,6 +69,9 @@ pub struct Launch {
     pub args: Vec<OsString>,
     pub env: BTreeMap<String, String>,
     pub session_meta: Option<Value>,
+    pub system_prompt: Option<String>,
+    /// Offer forms and links to the agent. Only an interactive chat can show them.
+    pub elicitation: bool,
 }
 
 /// All provider-specific behavior needed to run one ACP harness.
@@ -117,19 +137,38 @@ pub(super) fn local_skills(directory: &Path) -> Result<Vec<String>> {
     Ok(skills)
 }
 
-pub(super) fn link_authentication(source: Option<PathBuf>, destination: &Path) -> Result<()> {
+/// The owner's harness configuration directory: `$variable`, else `~/<default>`.
+pub(super) fn owner_directory(variable: &str, default: &str) -> Option<PathBuf> {
+    env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(default)))
+}
+
+pub(super) fn any_variable_set(names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Links an owner file into the private runtime unless the runtime has its own copy.
+pub(super) fn link_file(source: Option<PathBuf>, destination: &Path) -> Result<()> {
     if destination.exists() {
         return Ok(());
     }
     let Some(source) = source.filter(|source| source.is_file()) else {
         return Ok(());
     };
-
+    // A link to a removed file blocks a new link.
+    if destination.is_symlink() {
+        fs::remove_file(destination)
+            .with_context(|| format!("could not replace {}", destination.display()))?;
+    }
     std::os::unix::fs::symlink(&source, destination)
-        .with_context(|| format!("could not link authentication from {}", source.display()))
+        .with_context(|| format!("could not link {}", source.display()))
 }
 
-/// Installs the latest adapter release and returns its version.
+/// Installs the newest adapter release in the tested range and returns its version.
 pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<Option<String>> {
     let Some(adapter) = harness.adapter() else {
         return Ok(None);
@@ -143,7 +182,7 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<Optio
             .join(format!(".acp-{}-{}", harness.id(), uuid::Uuid::now_v7()));
     fs::create_dir(&temporary)?;
     let temporary = TemporaryAdapter(temporary);
-    let package = format!("{}@latest", adapter.package);
+    let package = adapter.npm_package();
 
     let input = crate::prompts::CancellationInput::new()?;
     let spinner = crate::progress::start("Preparing harness...".to_owned());
@@ -407,6 +446,8 @@ pub fn launch(root: &Path, harness_id: &str, instruction: &str) -> Result<Launch
         args: options.args,
         env: options.env,
         session_meta: options.session_meta,
+        system_prompt: options.system_prompt,
+        elicitation: false,
     })
 }
 
@@ -456,6 +497,19 @@ mod tests {
     }
 
     #[test]
+    fn link_file_replaces_a_dangling_link() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("auth.json");
+        std::os::unix::fs::symlink(root.path().join("removed.json"), &destination).unwrap();
+        let source = root.path().join("source.json");
+        fs::write(&source, "{}").unwrap();
+
+        link_file(Some(source.clone()), &destination).unwrap();
+
+        assert_eq!(fs::read_link(&destination).unwrap(), source);
+    }
+
+    #[test]
     fn versions_compare_numerically_and_prereleases_sort_first() {
         assert!(meets_floor("0.76.0", "0.76.0"));
         assert!(meets_floor("0.100.0", "0.76.0"));
@@ -499,15 +553,15 @@ mod tests {
         let error = check_installed_floor(root.path(), &claude::CLAUDE).unwrap_err();
         assert!(error.to_string().contains("lazyagents repair"), "{error}");
 
-        write_manifest(root.path(), r#"{"version":"0.75.9"}"#);
+        write_manifest(root.path(), r#"{"version":"0.106.9"}"#);
         let error = check_installed_floor(root.path(), &claude::CLAUDE).unwrap_err();
         assert!(
-            error.to_string().contains("0.75.9 is older than 0.76.0"),
+            error.to_string().contains("0.106.9 is older than 0.107.0"),
             "{error}"
         );
         assert!(error.to_string().contains("lazyagents repair"), "{error}");
 
-        write_manifest(root.path(), r#"{"version":"0.77.1"}"#);
+        write_manifest(root.path(), r#"{"version":"0.107.1"}"#);
         check_installed_floor(root.path(), &claude::CLAUDE).unwrap();
         check_installed_floor(root.path(), &opencode::OPENCODE).unwrap();
     }

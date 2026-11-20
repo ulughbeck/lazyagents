@@ -134,7 +134,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> requests.jsonl
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{},"close":{}}}}}'
       ;;
     *'"method":"session/new"'*|*'"method":"session/resume"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"test","configOptions":[{"id":"model","type":"select","category":"model","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"deep","name":"Deep"}]},{"id":"effort","type":"select","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}'
@@ -425,29 +425,6 @@ fn terminal_formats_submitted_prompts_and_shows_waiting_before_output() {
     .unwrap();
 
     let (mut chat, mut terminal, _slave) = terminal_chat(root.path(), 40, 24);
-    fn wait_terminal(chat: &mut Chat, terminal: &mut fs::File, suffix: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut plain = String::new();
-        let mut ansi = 0;
-        loop {
-            let byte = chat
-                .output
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|error| panic!("waiting for {suffix:?}: {error}; {:?}", chat.text));
-            chat.text.push(char::from(byte));
-            plain_byte(&mut plain, &mut ansi, byte);
-            if chat.text.ends_with("\x1b[6n") {
-                terminal.write_all(b"\x1b[1;1R").unwrap();
-            }
-            if if suffix.contains('\x1b') {
-                chat.text.ends_with(suffix)
-            } else {
-                plain.ends_with(suffix)
-            } {
-                break;
-            }
-        }
-    }
     wait_terminal(&mut chat, &mut terminal, "recovered draft");
     wait_terminal(&mut chat, &mut terminal, "\r\x1b[17C");
     let rule = "─".repeat(40).bytes().map(char::from).collect::<String>();
@@ -786,6 +763,131 @@ fn terminal_formats_submitted_prompts_and_shows_waiting_before_output() {
         )));
 }
 
+fn wait_terminal(chat: &mut Chat, terminal: &mut fs::File, suffix: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut plain = String::new();
+    let mut ansi = 0;
+    loop {
+        let byte = chat
+            .output
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| panic!("waiting for {suffix:?}: {error}; {:?}", chat.text));
+        chat.text.push(char::from(byte));
+        plain_byte(&mut plain, &mut ansi, byte);
+        if chat.text.ends_with("\x1b[6n") {
+            terminal.write_all(b"\x1b[1;1R").unwrap();
+        }
+        if if suffix.contains('\x1b') {
+            chat.text.ends_with(suffix)
+        } else {
+            plain.ends_with(suffix)
+        } {
+            break;
+        }
+    }
+}
+
+#[test]
+fn model_command_asks_for_model_settings_and_new_sessions_restore_them() {
+    let root = agent();
+    let adapter = root.path().join("bin/opencode");
+    let context = r#"{"id":"context","name":"Context","type":"select","category":"model_config","currentValue":"200k","options":[{"value":"200k","name":"200K"},{"value":"1m","name":"1M"}]}"#;
+    let fast = r#"{"id":"fast-mode","name":"Fast mode","type":"boolean","category":"model_config","currentValue":false}"#;
+    let effort = r#"{"id":"effort","type":"select","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}"#;
+    let deep = r#"{"id":"model","type":"select","category":"model","currentValue":"deep","options":[{"value":"fast","name":"Fast"},{"value":"deep","name":"Deep"}]}"#;
+    let source = fs::read_to_string(&adapter).unwrap();
+    let new_session = r#"{"value":"high","name":"High"}]}]}}'"#;
+    let generic = "    *'\"method\":\"session/set_config_option\"'*)\n";
+    assert!(source.contains(new_session) && source.contains(generic));
+    // Only the deep model offers fast mode, so the list changes after the first answer.
+    let source = source
+        .replace(
+            new_session,
+            &format!(r#"{{"value":"high","name":"High"}}]}},{context}]}}}}'"#),
+        )
+        .replace(
+            generic,
+            &format!(
+                r#"    *'"method":"session/set_config_option"'*'"configId":"model"'*'"value":"deep"'*)
+      request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"configOptions":[{deep},{effort},{fast},{context}]}}}}\n' "$request_id"
+      ;;
+{generic}"#
+            ),
+        );
+    fs::write(&adapter, source).unwrap();
+
+    let (mut chat, mut terminal, _slave) = terminal_chat(root.path(), 80, 24);
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/model\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Select model");
+    terminal.write_all(b"\x1b[B\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Select reasoning level");
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "> no");
+    terminal.write_all(b"\x1b[A\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Select context");
+    terminal.write_all(b"\x1b[B\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Context: 1M\r\n");
+    assert!(chat.text.contains("Reasoning: Low"));
+    assert!(chat.text.contains("Fast mode: on"));
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/status\r").unwrap();
+    wait_terminal(
+        &mut chat,
+        &mut terminal,
+        "usage: not reported by harness\r\n",
+    );
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    assert!(chat.text.contains("fast mode: on\r\ncontext: 1M\r\n"));
+    terminal.write_all(b"/quit\r").unwrap();
+    chat.wait_for_exit();
+
+    let settings = |root: &std::path::Path| {
+        fs::read_to_string(root.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|request| request["method"] == "session/set_config_option")
+            .map(|request| request["params"].clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        serde_json::json!({"sessionId": "test", "configId": "model", "value": "deep"}),
+        serde_json::json!({"sessionId": "test", "configId": "fast-mode", "type": "boolean", "value": true}),
+        serde_json::json!({"sessionId": "test", "configId": "context", "value": "1m"}),
+    ];
+    assert_eq!(settings(root.path()), expected);
+    let config_path = root.path().join(".agents/agent.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["model"], "deep");
+    assert_eq!(config["thinking"], "low");
+    assert_eq!(
+        config["model_config"],
+        serde_json::json!({"context": "1m", "fast-mode": true})
+    );
+
+    config["model_config"]["retired"] = "x".into();
+    fs::write(&config_path, config.to_string()).unwrap();
+    fs::remove_file(root.path().join("requests.jsonl")).unwrap();
+    let mut chat = Chat::start(root.path(), false);
+    chat.wait_status("> ");
+    assert!(chat
+        .status_text
+        .contains("warning: saved model setting \"retired\" x is unavailable; using the default"));
+    chat.send("/quit\n");
+    chat.wait_for_exit();
+    assert_eq!(
+        settings(root.path()),
+        [
+            expected[0].clone(),
+            expected[2].clone(),
+            expected[1].clone()
+        ]
+    );
+}
+
 fn terminal_chat(root: &std::path::Path, columns: u16, rows: u16) -> (Chat, fs::File, fs::File) {
     terminal_command(root, columns, rows, "chat")
 }
@@ -1082,6 +1184,7 @@ fn preparing_agent() -> tempfile::TempDir {
             "npm",
             r#"#!/bin/sh
 set -eu
+printf '%s\n' "$@" > npm-args
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --prefix ]; then
     shift
@@ -1525,7 +1628,7 @@ fn repair_replaces_adapter_only_after_valid_installation() {
         ("exit 1\n", Some("npm could not install")),
         (
             "printf '%s\\n' '{\"version\":\"0.7.0\"}' > \"$prefix/node_modules/@automatalabs/pi-acp/package.json\"\n",
-            Some("needs 0.8.0 or newer"),
+            Some("needs 0.9.4 or newer"),
         ),
         (
             "printf '%s\\n' 'invalid' > \"$prefix/node_modules/@automatalabs/pi-acp/package.json\"\n",
@@ -1570,6 +1673,11 @@ fn repair_replaces_adapter_only_after_valid_installation() {
             assert_eq!(fs::read_to_string(runtime.join("old-only")).unwrap(), "previous files");
         } else {
             assert!(String::from_utf8_lossy(&output.stdout).contains("adapter 99.0.0 is ready"));
+            let npm_args = fs::read_to_string(root.path().join("npm-args")).unwrap();
+            assert!(
+                npm_args.lines().any(|arg| arg == "@automatalabs/pi-acp@>=0.9.4 <1.0.0"),
+                "{npm_args}"
+            );
             assert_eq!(
                 fs::read(runtime.join("node_modules/.bin/pi-acp")).unwrap(),
                 fs::read(root.path().join("bin/opencode")).unwrap()
@@ -1858,4 +1966,461 @@ fn setup_cancel_after_resize_removes_menu_and_blank_rows() {
         assert_ne!(mode.c_lflag & libc::ICANON, 0);
         assert_ne!(mode.c_lflag & libc::ECHO, 0);
     }
+}
+
+fn session_update(update: serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": "test", "update": update}})
+    .to_string()
+}
+
+/// Makes the fake adapter send `after_session` after its session response and
+/// `in_prompt` at the start of each ordinary turn. A `sleep` entry runs as is.
+fn add_messages(root: &std::path::Path, after_session: &[String], in_prompt: &[String]) {
+    let lines = |messages: &[String]| {
+        messages
+            .iter()
+            .map(|message| match message.strip_prefix("sleep ") {
+                Some(_) => format!("      {message}\n"),
+                None => format!("      printf '%s\\n' '{message}'\n"),
+            })
+            .collect::<String>()
+    };
+    let adapter = root.join("bin/opencode");
+    let source = fs::read_to_string(&adapter).unwrap();
+    let session_end = "      ;;\n    *'\"method\":\"session/set_config_option\"'*)\n";
+    let prompt = "      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":\"Before\\n\\n\"}}}}'\n";
+    assert!(source.contains(session_end) && source.contains(prompt));
+    let source = source
+        .replacen(
+            session_end,
+            &format!("{}{session_end}", lines(after_session)),
+            1,
+        )
+        .replace(prompt, &format!("{}{prompt}", lines(in_prompt)));
+    fs::write(adapter, source).unwrap();
+}
+
+fn compaction(id: &str, status: &str) -> String {
+    session_update(serde_json::json!({
+        "sessionUpdate": "compaction_update", "compactionId": id, "status": status
+    }))
+}
+
+fn notice(severity: &str, title: &str, description: Option<&str>) -> String {
+    session_update(serde_json::json!({
+        "sessionUpdate": "notice", "severity": severity, "title": title, "description": description
+    }))
+}
+
+fn commands(commands: &[(&str, &str, Option<&str>)]) -> String {
+    let commands = commands
+        .iter()
+        .map(|(name, description, hint)| {
+            serde_json::json!({"name": name, "description": description,
+                "input": hint.map(|hint| serde_json::json!({"hint": hint}))})
+        })
+        .collect::<Vec<_>>();
+    session_update(serde_json::json!({
+        "sessionUpdate": "available_commands_update", "availableCommands": commands
+    }))
+}
+
+fn logged_records(root: &std::path::Path) -> Vec<serde_json::Value> {
+    let path = fs::read_dir(root.join(".agents/sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn sent_requests(root: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(root.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn piped_chat_keeps_notices_off_stdout_and_compaction_in_history() {
+    let root = agent();
+    let permission = r#"{"jsonrpc":"2.0","id":90,"method":"session/request_permission","params":{"toolCall":{"title":"Idle write"},"options":[{"optionId":"allow","name":"Allow once","kind":"allow_once"}]}}"#;
+    add_messages(
+        root.path(),
+        &[
+            notice("info", "Session notice", None),
+            permission.to_owned(),
+        ],
+        &[
+            notice("warning", "Prompt notice", Some("Details")),
+            compaction("c1", "in_progress"),
+            session_update(serde_json::json!({
+                "sessionUpdate": "compaction_summary_chunk", "compactionId": "c1",
+                "content": {"type": "text", "text": "Hidden summary"}
+            })),
+            compaction("c1", "completed"),
+        ],
+    );
+    let mut chat = Chat::start(root.path(), false);
+    chat.wait_status("Session notice\n");
+    chat.send("/web agent client protocol\n");
+    chat.wait_for("After\n\n");
+    chat.send("/quit\n");
+    chat.wait_for_exit();
+    // The output readers stop at end of file.
+    while let Ok(byte) = chat.status.recv_timeout(Duration::from_secs(2)) {
+        chat.status_text.push(char::from(byte));
+    }
+    assert_eq!(chat.text, "Before\n\nAfter\n\n");
+    assert!(chat.status_text.contains("! Prompt notice: Details\n"));
+    assert!(chat.status_text.contains("Context compacted\n"));
+    assert!(!chat.status_text.contains("Hidden summary"));
+
+    let requests = sent_requests(root.path());
+    let answer = requests
+        .iter()
+        .find(|request| request["id"] == 90 && request.get("result").is_some())
+        .expect("the idle permission request has no answer");
+    assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
+    let prompt = requests
+        .iter()
+        .find(|request| request["method"] == "session/prompt")
+        .unwrap();
+    assert_eq!(
+        prompt["params"]["prompt"],
+        serde_json::json!([{"type": "text", "text": "/web agent client protocol"}])
+    );
+    let records = logged_records(root.path());
+    assert!(records
+        .iter()
+        .any(|record| record["type"] == "message"
+            && record["content"] == "/web agent client protocol"));
+    let compactions = records
+        .iter()
+        .filter(|record| record["event"]["event"] == "compaction")
+        .collect::<Vec<_>>();
+    assert_eq!(compactions.len(), 1);
+    assert_eq!(
+        compactions[0]["event"]["data"],
+        serde_json::json!({"status": "completed"})
+    );
+    assert!(!records
+        .iter()
+        .any(|record| record.to_string().contains("notice")));
+
+    let mut resumed = Chat::start(root.path(), true);
+    resumed.wait_status("> ");
+    let history = resumed.status_text.clone();
+    resumed.send("/quit\n");
+    resumed.wait_for_exit();
+    let prompt = history.find("| /web agent client protocol").unwrap();
+    let compacted = history.find("Context compacted").unwrap();
+    let before = history.find("Before").unwrap();
+    assert!(prompt < compacted && compacted < before, "{history}");
+    assert!(!history.contains("Prompt notice"), "{history}");
+}
+
+#[test]
+fn terminal_menu_shows_agent_commands_and_prints_idle_lines_above_the_editor() {
+    let root = agent();
+    let first = commands(&[
+        ("status", "agent status", None),
+        ("web", "search the web", Some("query")),
+    ]);
+    let later = commands(&[
+        ("status", "agent status", None),
+        ("web", "search the web", Some("query")),
+        ("later", "arrived while typing", None),
+    ]);
+    add_messages(
+        root.path(),
+        &[
+            first,
+            notice("error", "Session notice", Some("Check MCP")),
+            format!("sleep 0.5; printf '%s\\n' '{later}'"),
+        ],
+        &[compaction("c1", "failed")],
+    );
+    let (mut chat, mut terminal, _slave) = terminal_chat(root.path(), 80, 24);
+    wait_terminal(&mut chat, &mut terminal, "Session notice: Check MCP\r\n");
+    // Error notices are red. The capture holds one char per byte.
+    assert!(chat
+        .text
+        .contains("\x1b[31m\u{e2}\u{9c}\u{97} Session notice: Check MCP\x1b[0m"));
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    let menu_start = chat.text.len();
+    terminal.write_all(b"/").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "arrived while typing");
+    let menu = &chat.text[menu_start..];
+    assert!(menu.contains("/web"), "{menu:?}");
+    assert!(menu.contains("search the web (query)"), "{menu:?}");
+    assert!(menu.contains("show session status"), "{menu:?}");
+    assert!(!menu.contains("agent status"), "{menu:?}");
+    terminal.write_all(b"we\t").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "\r\x1b[7C");
+    terminal.write_all(b"rust\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Context compaction failed\r\n");
+    wait_terminal(&mut chat, &mut terminal, "After\r\n");
+    assert!(chat
+        .text
+        .contains("\x1b[0;97m| \x1b[0m\x1b[0;1;97m/web rust\x1b[0m"));
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/la\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "After\r\n");
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/status\r").unwrap();
+    wait_terminal(
+        &mut chat,
+        &mut terminal,
+        "usage: not reported by harness\r\n",
+    );
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/quit\r").unwrap();
+    chat.wait_for_exit();
+    let prompts = sent_requests(root.path())
+        .into_iter()
+        .filter(|request| request["method"] == "session/prompt")
+        .map(|request| request["params"]["prompt"][0]["text"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, ["/web rust", "/later"]);
+}
+
+const ELICITATION_FORM: &str = r#"{"jsonrpc":"2.0","id":80,"method":"elicitation/create","params":{"sessionId":"test","mode":"form","message":"Setup details","requestedSchema":{"type":"object","properties":{"name":{"type":"string","title":"Name","description":"Your full name","minLength":2,"default":"Ada"},"count":{"type":"integer","title":"Count","minimum":1,"maximum":9},"ratio":{"type":"number","title":"Ratio"},"agree":{"type":"boolean","title":"Agree","default":true},"color":{"type":"string","title":"Color","oneOf":[{"const":"red","title":"Red","description":"warm"},{"const":"blue","title":"Blue","description":"cool"}]},"tags":{"type":"array","title":"Tags","items":{"type":"string","enum":["alpha","beta"]}}},"required":["name","count","agree","color"]}}}"#;
+
+/// Makes the fake adapter ask a form for the prompt `Form`.
+/// It logs the answer and then finishes the turn.
+fn elicitation_agent() -> tempfile::TempDir {
+    let root = agent();
+    let ask = |message: &str| {
+        format!(
+            "          printf '%s\\n' '{message}'\n          IFS= read -r answer\n          printf '%s\\n' \"$answer\" >> requests.jsonl\n"
+        )
+    };
+    let cases = format!(
+        "        *'\"text\":\"Form\"'*)\n{}          ;;\n",
+        ask(ELICITATION_FORM)
+    );
+    let adapter = root.path().join("bin/opencode");
+    let source = fs::read_to_string(&adapter).unwrap();
+    let marker = "        *'\"text\":\"Wait\"'*)\n";
+    assert!(source.contains(marker));
+    fs::write(
+        &adapter,
+        source.replace(marker, &format!("{cases}{marker}")),
+    )
+    .unwrap();
+    root
+}
+
+/// The results that the client sent for agent request `id`, oldest first.
+fn answers(root: &std::path::Path, id: u64) -> Vec<serde_json::Value> {
+    sent_requests(root)
+        .into_iter()
+        .filter(|message| message["id"] == id && message.get("method").is_none())
+        .map(|message| {
+            message
+                .get("result")
+                .or_else(|| message.get("error"))
+                .cloned()
+                .unwrap()
+        })
+        .collect()
+}
+
+fn terminal_text(chat: &Chat) -> String {
+    String::from_utf8(chat.text.chars().map(|character| character as u8).collect()).unwrap()
+}
+
+#[test]
+fn terminal_form_validates_reviews_and_sends_typed_answers() {
+    let root = elicitation_agent();
+    // The idle timeout must not run while the user answers.
+    let config_path = root.path().join(".agents/agent.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["idle_timeout"] = 1.into();
+    fs::write(&config_path, config.to_string()).unwrap();
+    let (mut chat, mut terminal, _slave) = terminal_chat(root.path(), 80, 24);
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"Form\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Setup details");
+    // The default is pre-filled.
+    wait_terminal(&mut chat, &mut terminal, "Your full name");
+    assert!(terminal_text(&chat).contains("name: Ada"));
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "count: ");
+    terminal.write_all(b"12\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "enter 9 or less");
+    terminal.write_all(b"\x7f\x7f3\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "optional, leave empty to skip");
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "type to filter");
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "cool");
+    terminal.write_all(b"\x1b[B\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "space to select");
+    std::thread::sleep(Duration::from_millis(1500));
+    terminal.write_all(b" \x1b[B \r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "select a field to change it");
+    let review = terminal_text(&chat);
+    let review = &review[review.rfind("send answers?").unwrap()..];
+    for line in [
+        "submit",
+        "name: Ada",
+        "count: 3",
+        "ratio: skipped",
+        "agree: yes",
+        "color: Blue",
+        "tags: alpha, beta",
+        "decline",
+    ] {
+        assert!(review.contains(line), "{line}: {review:?}");
+    }
+    // Change the count, then submit.
+    terminal.write_all(b"\x1b[B\x1b[B\r").unwrap();
+    // Wait past the review answer until the field prompt shows its cursor.
+    wait_terminal(&mut chat, &mut terminal, "send answers? count: 3");
+    wait_terminal(&mut chat, &mut terminal, "\x1b[?25h");
+    terminal.write_all(b"\x7f4\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "count: 4");
+    wait_terminal(&mut chat, &mut terminal, "select a field to change it");
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "answered\r\n");
+    wait_terminal(&mut chat, &mut terminal, "After\r\n");
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/quit\r").unwrap();
+    chat.wait_for_exit();
+    assert!(!terminal_text(&chat).contains("timed out"));
+
+    let requests = sent_requests(root.path());
+    assert_eq!(
+        requests[0]["params"]["clientCapabilities"]["elicitation"],
+        serde_json::json!({"form": {}})
+    );
+    assert_eq!(
+        answers(root.path(), 80),
+        [serde_json::json!({"action": "accept", "content": {
+            "name": "Ada", "count": 4, "agree": true, "color": "blue", "tags": ["alpha", "beta"]
+        }})]
+    );
+    let records = logged_records(root.path());
+    let asked = records
+        .iter()
+        .filter(|record| record["event"]["event"] == "elicitation")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        asked[0]["event"]["data"],
+        serde_json::json!({"message": "Setup details", "outcome": "answered"})
+    );
+    assert_eq!(asked.len(), 1);
+    assert!(!records
+        .iter()
+        .any(|record| record.to_string().contains("beta")));
+}
+
+#[test]
+fn terminal_form_decline_escape_and_ctrl_c_answer_and_appear_in_history() {
+    let root = elicitation_agent();
+    let (mut chat, mut terminal, _slave) = terminal_chat(root.path(), 80, 24);
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"Form\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Your full name");
+    terminal.write_all(b"\x1b").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "cancelled\r\n");
+    wait_terminal(&mut chat, &mut terminal, "After\r\n");
+    wait_terminal(&mut chat, &mut terminal, "> ");
+
+    terminal.write_all(b"Form\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Your full name");
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "count: ");
+    terminal.write_all(b"1\r").unwrap();
+    for wait in [
+        "leave empty to skip",
+        "type to filter",
+        "cool",
+        "space to select",
+    ] {
+        wait_terminal(&mut chat, &mut terminal, wait);
+        terminal.write_all(b"\r").unwrap();
+    }
+    wait_terminal(&mut chat, &mut terminal, "select a field to change it");
+    terminal.write_all(&b"\x1b[B".repeat(7)).unwrap();
+    terminal.write_all(b"\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "declined\r\n");
+    wait_terminal(&mut chat, &mut terminal, "After\r\n");
+    wait_terminal(&mut chat, &mut terminal, "> ");
+
+    terminal.write_all(b"Form\r").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Your full name");
+    terminal.write_all(b"\x03").unwrap();
+    wait_terminal(&mut chat, &mut terminal, "Turn cancelled.\r\n");
+    wait_terminal(&mut chat, &mut terminal, "> ");
+    terminal.write_all(b"/quit\r").unwrap();
+    chat.wait_for_exit();
+
+    let cancel = serde_json::json!({"action": "cancel"});
+    let decline = serde_json::json!({"action": "decline"});
+    assert_eq!(
+        answers(root.path(), 80),
+        [cancel.clone(), decline, cancel.clone()]
+    );
+    // Ctrl-C answers the form before it stops the turn.
+    let requests = sent_requests(root.path());
+    let last_answer = requests
+        .iter()
+        .rposition(|message| message["id"] == 80 && message["result"] == cancel)
+        .unwrap();
+    let stop = requests
+        .iter()
+        .position(|message| message["method"] == "session/cancel")
+        .unwrap();
+    assert!(last_answer < stop);
+
+    let mut resumed = Chat::start(root.path(), true);
+    resumed.wait_status("> ");
+    resumed.send("/quit\n");
+    resumed.wait_for_exit();
+    let history = String::from_utf8(
+        resumed
+            .status_text
+            .chars()
+            .map(|character| character as u8)
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(
+        history.matches("⊘ Setup details · cancelled\n").count(),
+        2,
+        "{history}"
+    );
+    assert_eq!(
+        history.matches("⊘ Setup details · declined\n").count(),
+        1,
+        "{history}"
+    );
+}
+
+#[test]
+fn piped_chat_rejects_forms() {
+    // Piped chat does not advertise elicitation, so a request is invalid.
+    let root = elicitation_agent();
+    let mut chat = Chat::start(root.path(), false);
+    chat.wait_status("> ");
+    chat.send("Form\n");
+    chat.wait_for("After\n\n");
+    chat.send("/quit\n");
+    chat.wait_for_exit();
+    let requests = sent_requests(root.path());
+    assert!(requests[0]["params"]["clientCapabilities"]
+        .get("elicitation")
+        .is_none());
+    assert_eq!(answers(root.path(), 80)[0]["code"], -32602);
 }

@@ -40,18 +40,13 @@ impl fmt::Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 impl Client {
-    pub fn friendly_error(&self, error: &anyhow::Error, system_error: &str) -> String {
-        friendly_error(self.runtime_name, error, system_error, &self.diagnostics())
+    pub fn friendly_error(&self, error: &anyhow::Error) -> String {
+        friendly_error(self.runtime_name, error, &self.diagnostics())
     }
 }
 
-pub fn friendly_error(
-    runtime_name: &str,
-    error: &anyhow::Error,
-    system_error: &str,
-    diagnostics: &[String],
-) -> String {
-    let details = format!("{system_error}\n{}\n{error:#}", diagnostics.join("\n"));
+pub fn friendly_error(runtime_name: &str, error: &anyhow::Error, diagnostics: &[String]) -> String {
+    let details = format!("{}\n{error:#}", diagnostics.join("\n"));
     let lowercase = details.to_ascii_lowercase();
     if lowercase.contains("usage limit") {
         if let Some(start) = lowercase.find("try again at") {
@@ -90,7 +85,7 @@ mod tests {
     fn identifies_provider_api_key_errors_as_authentication_errors() {
         let error = anyhow::anyhow!("No API key for openrouter");
         assert_eq!(
-            friendly_error("Pi", &error, "", &[]),
+            friendly_error("Pi", &error, &[]),
             "Pi authentication failed. Sign in and try again."
         );
     }

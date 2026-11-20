@@ -6,10 +6,56 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use super::input::DARK_GRAY;
-use crate::acp::{PermissionOption, StreamEvent, ToolStatus};
+use crate::acp::{
+    CompactionEnd, ElicitationOutcome, Notice, PermissionOption, PermissionRequest, Severity,
+    StreamEvent, ToolStatus,
+};
 use crate::session::{Role, SessionEntry};
 
 pub(crate) const LIGHT_GRAY: &str = "38;5;250";
+
+/// One compact status line, without its line break.
+pub(crate) struct Line {
+    pub color: &'static str,
+    pub text: String,
+}
+
+pub(crate) fn notice_line(notice: &Notice) -> Line {
+    let (color, symbol) = match notice.severity {
+        Severity::Warning => ("33", "! "),
+        Severity::Error => ("31", "✗ "),
+        Severity::Info | Severity::Other => (LIGHT_GRAY, ""),
+    };
+    let text = match notice.description.as_deref() {
+        Some(description) if !description.trim().is_empty() => {
+            format!("{symbol}{}: {description}", notice.title)
+        }
+        _ => format!("{symbol}{}", notice.title),
+    };
+    Line {
+        color,
+        text: compact_line(&text, display_width()),
+    }
+}
+
+pub(crate) fn compaction_line(end: &CompactionEnd) -> Line {
+    let text = match end {
+        CompactionEnd::Completed => "Context compacted".to_owned(),
+        CompactionEnd::Failed { error: Some(error) } => {
+            format!("Context compaction failed: {error}")
+        }
+        CompactionEnd::Failed { error: None } => "Context compaction failed".to_owned(),
+        CompactionEnd::Cancelled => "Context compaction cancelled".to_owned(),
+    };
+    Line {
+        color: LIGHT_GRAY,
+        text: compact_line(&text, display_width()),
+    }
+}
+
+pub(crate) fn print_line(terminal: bool, line: &Line) {
+    print_colored(terminal, line.color, &format!("{}\n", line.text));
+}
 
 pub(crate) struct TurnDisplay {
     terminal: bool,
@@ -38,11 +84,59 @@ impl TurnDisplay {
         }
     }
 
-    pub(crate) fn handle(
+    /// Shows a permission request and asks the user when the request is live.
+    pub(crate) fn permission(
         &mut self,
-        event: StreamEvent,
-        select_permission: impl FnOnce(&str, &[PermissionOption], &str) -> Result<Option<String>>,
+        request: &PermissionRequest,
+        select: impl FnOnce(&str, &[PermissionOption], &str) -> Result<Option<String>>,
     ) -> Result<Option<String>> {
+        self.stop_waiting();
+        self.flush_reasoning();
+        self.flush_assistant();
+        let answered = self.replay || request.cancelled || !self.terminal;
+        if answered {
+            render_permission_request(self.terminal, &request.title);
+        }
+        let details = request
+            .tool_call
+            .as_ref()
+            .map(permission_details)
+            .unwrap_or_default();
+        if !details.is_empty() {
+            print_preview(self.terminal, &details);
+        }
+        io::stdout().flush()?;
+        if answered {
+            Ok(None)
+        } else {
+            select(&request.title, &request.options, &details)
+        }
+    }
+
+    /// Ends live output before a prompt takes the terminal.
+    pub(crate) fn pause(&mut self) -> Result<()> {
+        self.stop_waiting();
+        self.flush_reasoning();
+        self.flush_assistant();
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn notice(&mut self, notice: &Notice) -> Result<()> {
+        self.show_line(&notice_line(notice));
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    fn show_line(&mut self, line: &Line) {
+        self.stop_waiting();
+        self.flush_reasoning();
+        self.flush_assistant();
+        print_line(self.terminal, line);
+        self.start_waiting();
+    }
+
+    pub(crate) fn handle(&mut self, event: StreamEvent) -> Result<()> {
         match event {
             StreamEvent::Assistant(text) => {
                 self.flush_reasoning();
@@ -131,31 +225,8 @@ impl TurnDisplay {
                 }
                 self.start_waiting();
             }
-            StreamEvent::PermissionRequest {
-                title,
-                tool_call,
-                options,
-                cancelled,
-            } => {
-                self.stop_waiting();
-                self.flush_reasoning();
-                self.flush_assistant();
-                if self.replay || cancelled || !self.terminal {
-                    render_permission_request(self.terminal, &title);
-                }
-                let details = tool_call
-                    .as_ref()
-                    .map(permission_details)
-                    .unwrap_or_default();
-                if !details.is_empty() {
-                    print_preview(self.terminal, &details);
-                }
-                io::stdout().flush()?;
-                return if self.replay || cancelled || !self.terminal {
-                    Ok(None)
-                } else {
-                    select_permission(&title, &options, &details)
-                };
+            StreamEvent::PermissionRequest(request) => {
+                self.permission(&request, |_, _, _| Ok(None))?;
             }
             StreamEvent::PermissionDecision { title, allowed } => {
                 self.stop_waiting();
@@ -164,10 +235,18 @@ impl TurnDisplay {
                 render_permission_decision(self.terminal, &title, allowed);
                 self.start_waiting();
             }
+            StreamEvent::Elicitation { message, outcome } => {
+                self.stop_waiting();
+                self.flush_reasoning();
+                self.flush_assistant();
+                render_elicitation(self.terminal, &message, outcome);
+                self.start_waiting();
+            }
+            StreamEvent::Compaction(end) => self.show_line(&compaction_line(&end)),
             StreamEvent::SystemError(_) => {}
         }
         io::stdout().flush()?;
-        Ok(None)
+        Ok(())
     }
 
     pub(crate) fn start_waiting(&mut self) {
@@ -471,6 +550,18 @@ fn render_permission_decision(terminal: bool, title: &str, allowed: bool) {
     print_colored(terminal, LIGHT_GRAY, &format!(" {title}\n"));
 }
 
+fn render_elicitation(terminal: bool, message: &str, outcome: ElicitationOutcome) {
+    let (symbol, color, label) = match outcome {
+        ElicitationOutcome::Answered => ("✓", "32", "answered"),
+        ElicitationOutcome::Declined => ("⊘", "31", "declined"),
+        ElicitationOutcome::Cancelled => ("⊘", "31", "cancelled"),
+        ElicitationOutcome::Unsupported => ("⊘", "31", "declined, not supported"),
+    };
+    print_colored(terminal, color, symbol);
+    let message = compact_line(message, display_width().saturating_sub(label.len() + 4));
+    print_colored(terminal, LIGHT_GRAY, &format!(" {message} · {label}\n"));
+}
+
 fn tool_title(title: &str, kind: Option<&str>, input: Option<&serde_json::Value>) -> String {
     let command = input.and_then(|value| {
         value
@@ -559,12 +650,12 @@ pub(crate) fn render_history(entries: Vec<SessionEntry>) -> Result<()> {
                 render_historical_user_prompt(&message.content);
             }
             SessionEntry::Message(message) if message.role == Role::Assistant => {
-                display.handle(StreamEvent::Assistant(message.content), |_, _, _| Ok(None))?;
+                display.handle(StreamEvent::Assistant(message.content))?;
                 display.flush_assistant();
             }
             SessionEntry::Message(_) => {}
             SessionEntry::Stream { event } => {
-                display.handle(event, |_, _, _| Ok(None))?;
+                display.handle(event)?;
             }
             SessionEntry::TurnEnd => display.finish(),
             SessionEntry::Error { message, .. } => {
@@ -667,6 +758,35 @@ mod tests {
         assert!(details.contains("before"));
         assert!(details.contains("after"));
         assert_eq!(detail_lines("abcdefgh界界", 4).concat(), "abcdefgh界界");
+    }
+
+    #[test]
+    fn notices_and_compactions_are_single_lines() {
+        let notice = |severity, description: Option<&str>| {
+            notice_line(&Notice {
+                severity,
+                title: "MCP server\nunavailable".into(),
+                description: description.map(str::to_owned),
+            })
+        };
+        let line = notice(Severity::Warning, Some("Continuing without it."));
+        assert_eq!(
+            (line.color, line.text.as_str()),
+            ("33", "! MCP server unavailable: Continuing without it.")
+        );
+        let line = notice(Severity::Other, Some(" "));
+        assert_eq!(
+            (line.color, line.text.as_str()),
+            (LIGHT_GRAY, "MCP server unavailable")
+        );
+        assert_eq!(notice(Severity::Error, None).color, "31");
+        let line = compaction_line(&CompactionEnd::Failed {
+            error: Some("limit".into()),
+        });
+        assert_eq!(
+            (line.color, line.text.as_str()),
+            (LIGHT_GRAY, "Context compaction failed: limit")
+        );
     }
 
     #[test]

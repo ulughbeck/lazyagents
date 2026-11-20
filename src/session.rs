@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::acp::{StreamEvent, ToolStatus};
+use crate::acp::{PermissionRequest, StreamEvent, ToolStatus};
 use crate::config::AgentConfig;
 
 pub struct SessionLog {
@@ -337,12 +337,12 @@ fn decode_entry(value: Value) -> Result<Option<SessionEntry>> {
             input: value.get("input").filter(|v| !v.is_null()).cloned(),
             output: value.get("output").filter(|v| !v.is_null()).cloned(),
         },
-        "permission_request" => StreamEvent::PermissionRequest {
+        "permission_request" => StreamEvent::PermissionRequest(PermissionRequest {
             title: text("title", "Permission required"),
             tool_call: value.get("toolCall").cloned(),
             options: Vec::new(),
             cancelled: false,
-        },
+        }),
         "permission_decision" => StreamEvent::PermissionDecision {
             title: text("title", "Permission"),
             allowed: value.get("allowed").and_then(Value::as_bool) == Some(true),
@@ -355,6 +355,7 @@ fn decode_entry(value: Value) -> Result<Option<SessionEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::CompactionEnd;
     use tempfile::tempdir;
 
     #[test]
@@ -559,6 +560,87 @@ mod tests {
             SessionEntry::Stream {
                 event: StreamEvent::Reasoning(_)
             }
+        ));
+    }
+
+    #[test]
+    fn permission_requests_keep_their_stored_format() {
+        let stored = json!({"event": "permission_request", "data": {
+            "title": "bash",
+            "tool_call": {"title": "bash"},
+            "options": [{"id": "once", "kind": "allow_once", "label": "Allow once"}],
+            "cancelled": true
+        }});
+        let event = StreamEvent::PermissionRequest(PermissionRequest {
+            title: "bash".into(),
+            tool_call: Some(json!({"title": "bash"})),
+            options: vec![crate::acp::PermissionOption {
+                id: "once".into(),
+                kind: "allow_once".into(),
+                label: "Allow once".into(),
+            }],
+            cancelled: true,
+        });
+        assert_eq!(serde_json::to_value(&event).unwrap(), stored);
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("01.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"acp_session_id": "same"}),
+                json!({"type": "stream", "event": {"event": "permission_request",
+                    "data": {"title": "old", "options": []}}})
+            ),
+        )
+        .unwrap();
+        let entries = SessionLog::messages(directory.path(), "same").unwrap();
+        assert!(matches!(
+            &entries[0],
+            SessionEntry::Stream {
+                event: StreamEvent::PermissionRequest(PermissionRequest { title, cancelled: false, .. })
+            } if title == "old"
+        ));
+    }
+
+    #[test]
+    fn compaction_events_keep_their_stored_format() {
+        for (event, stored) in [
+            (
+                StreamEvent::Compaction(CompactionEnd::Failed {
+                    error: Some("too large".into()),
+                }),
+                json!({"event": "compaction", "data": {"status": "failed", "error": "too large"}}),
+            ),
+            (
+                StreamEvent::Compaction(CompactionEnd::Completed),
+                json!({"event": "compaction", "data": {"status": "completed"}}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&event).unwrap(), stored);
+            assert_eq!(
+                serde_json::from_value::<StreamEvent>(stored).unwrap(),
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn old_system_error_events_still_load() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("01.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"acp_session_id": "same"}),
+                json!({"type": "stream", "event": {"event": "system_error",
+                    "data": "[SYSTEM_ERROR] Internal error"}})
+            ),
+        )
+        .unwrap();
+        let entries = SessionLog::messages(directory.path(), "same").unwrap();
+        assert!(matches!(
+            &entries[..],
+            [SessionEntry::Stream { event: StreamEvent::SystemError(text) }] if text.starts_with("[SYSTEM_ERROR]")
         ));
     }
 

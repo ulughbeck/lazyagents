@@ -10,7 +10,7 @@ use inquire::validator::{StringValidator, Validation};
 use inquire::{Confirm, InquireError, Select, Text};
 use tokio::process::Command;
 
-use crate::acp::{Client, ConfigKind, StreamEvent};
+use crate::acp::{Client, ConfigKind, ConfigValue};
 use crate::config::{paths, AgentConfig};
 use crate::harness;
 use crate::harness::Harness;
@@ -91,7 +91,6 @@ async fn run_setup(root: PathBuf) -> Result<()> {
             return Err(anyhow!(crate::acp::friendly_error(
                 selected.display_name(),
                 &error,
-                "",
                 &[]
             )));
         }
@@ -161,7 +160,7 @@ async fn create_agent(
             match result {
                 Ok(()) => {
                     // Close the adapter below even if it ignores cancellation.
-                    let _ = client.cancel_prompt(|_| Ok(None)).await;
+                    let _ = client.cancel_prompt(()).await;
                     Err(Cancelled.into())
                 }
                 Err(error) => Err(error),
@@ -184,11 +183,7 @@ async fn ensure_authentication(harness: &dyn Harness) -> Result<()> {
     let Some(authentication) = harness.authentication() else {
         return Ok(());
     };
-    if authentication
-        .api_key_variables
-        .iter()
-        .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
-    {
+    if (authentication.has_provider_credentials)() {
         return Ok(());
     }
     let executable = harness::find_command(harness.runtime_command())
@@ -313,20 +308,11 @@ async fn generate_soul(client: &mut Client, config: &AgentConfig) -> Result<Stri
         "Create the system prompt for this agent.\n\nName: {}\nDescription: {}",
         config.name, config.description
     );
-    let mut system_error = String::new();
-    let soul = match client
-        .prompt(&request, |event| {
-            if let StreamEvent::SystemError(text) = event {
-                system_error.push_str(&text);
-            }
-            Ok(None)
-        })
-        .await
-    {
+    let soul = match client.prompt(&request, ()).await {
         Ok(soul) => soul,
         Err(error) => bail!(
-            "{}\n{error:#}\n{}\n{system_error}",
-            client.friendly_error(&error, &system_error),
+            "{}\n{error:#}\n{}",
+            client.friendly_error(&error),
             client.diagnostics().join("\n")
         ),
     };
@@ -418,7 +404,9 @@ async fn choose_option(
             .with_formatter(&|_| String::new())
             .prompt()
     })?;
-    client.set_config_option(&id, &selected.value).await?;
+    client
+        .set_config_option(&id, ConfigValue::Select(selected.value.clone()))
+        .await?;
     Ok(WizardSelection {
         value: Some(selected.value),
         label: selected.label,

@@ -1,7 +1,8 @@
 use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
 
-use inquire::{InquireError, Select};
+use inquire::list_option::ListOption;
+use inquire::{InquireError, MultiSelect, Select};
 
 /// Remove a prompt whose answer formatter is empty. Inquire leaves the cursor
 /// after its final line, even if the menu scrolled the terminal. A saved screen
@@ -46,25 +47,44 @@ pub fn run<T>(
 pub fn select<T: Display>(prompt: Select<'_, T>) -> Result<T, InquireError> {
     let message = prompt.message;
     let formatter = prompt.formatter;
-    let prefix = prompt.render_config.answered_prompt_prefix;
-    let colored = !prompt.render_config.answer.is_empty();
+    let config = prompt.render_config;
     let result = run(message, || {
         prompt.with_formatter(&|_| String::new()).raw_prompt()
     });
     if let Ok(answer) = &result {
-        let answer = crate::markdown::sanitize(&formatter(answer.as_ref()));
-        let message = crate::markdown::sanitize(message);
-        if colored {
-            let prefix_color = if prefix.style.fg.is_some() { "92" } else { "0" };
-            eprintln!(
-                "\x1b[{prefix_color}m{}\x1b[0m {message} \x1b[38;5;250m{answer}\x1b[0m",
-                prefix.content
-            );
-        } else {
-            eprintln!("{} {message} {answer}", prefix.content);
-        }
+        print_answer(&config, message, &formatter(answer.as_ref()));
     }
     result.map(|answer| answer.value)
+}
+
+/// Like `select`, for a menu with several answers.
+pub fn multi_select<T: Display>(prompt: MultiSelect<'_, T>) -> Result<Vec<T>, InquireError> {
+    let message = prompt.message;
+    let formatter = prompt.formatter;
+    let config = prompt.render_config;
+    let result = run(message, || {
+        prompt.with_formatter(&|_| String::new()).raw_prompt()
+    });
+    if let Ok(answers) = &result {
+        let answers = answers.iter().map(ListOption::as_ref).collect::<Vec<_>>();
+        print_answer(&config, message, &formatter(&answers));
+    }
+    result.map(|answers| answers.into_iter().map(|answer| answer.value).collect())
+}
+
+fn print_answer(config: &inquire::ui::RenderConfig<'_>, message: &str, answer: &str) {
+    let answer = crate::markdown::sanitize(answer);
+    let message = crate::markdown::sanitize(message);
+    let prefix = config.answered_prompt_prefix;
+    if config.answer.is_empty() {
+        eprintln!("{} {message} {answer}", prefix.content);
+    } else {
+        let prefix_color = if prefix.style.fg.is_some() { "92" } else { "0" };
+        eprintln!(
+            "\x1b[{prefix_color}m{}\x1b[0m {message} \x1b[38;5;250m{answer}\x1b[0m",
+            prefix.content
+        );
+    }
 }
 
 pub fn theme() -> inquire::ui::RenderConfig<'static> {

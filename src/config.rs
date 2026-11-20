@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,9 @@ pub struct AgentConfig {
     pub harness: String,
     pub model: Option<String>,
     pub thinking: Option<String>,
+    /// Values for the agent's `model_config` options, by option id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_config: BTreeMap<String, crate::acp::ConfigValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<crate::permissions::Approval>,
     #[serde(default)]
@@ -122,6 +126,7 @@ impl AgentConfig {
             harness: harness.to_owned(),
             model: None,
             thinking: None,
+            model_config: BTreeMap::new(),
             permissions: Vec::new(),
             permission_mode: Default::default(),
             draft: String::new(),

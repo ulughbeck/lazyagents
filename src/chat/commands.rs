@@ -1,3 +1,5 @@
+use crate::acp::AgentCommand;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Model,
@@ -51,12 +53,91 @@ impl Command {
             .find(|entry| entry.name == text)
             .map(|entry| entry.command)
     }
+}
 
-    pub fn name(self) -> &'static str {
-        COMMANDS
+/// One entry of the `/` menu.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuEntry {
+    /// With the leading slash.
+    pub name: String,
+    pub description: String,
+    /// Completion adds a space, so that the user can type the input.
+    pub takes_input: bool,
+}
+
+impl MenuEntry {
+    pub fn completion(&self) -> String {
+        if self.takes_input {
+            format!("{} ", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+/// Local commands, then agent commands. A local command wins when names collide.
+pub fn menu(agent: &[AgentCommand]) -> Vec<MenuEntry> {
+    let local = COMMANDS.iter().map(|command| MenuEntry {
+        name: command.name.to_owned(),
+        description: command.description.to_owned(),
+        takes_input: false,
+    });
+    let agent = agent
+        .iter()
+        .map(|command| {
+            let description = match &command.hint {
+                Some(hint) => format!("{} ({hint})", command.description),
+                None => command.description.clone(),
+            };
+            MenuEntry {
+                name: format!("/{}", command.name),
+                description: crate::markdown::sanitize(&description)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                takes_input: command.hint.is_some(),
+            }
+        })
+        .filter(|entry| Command::parse(&entry.name).is_none());
+    local.chain(agent).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_commands_win_over_agent_commands() {
+        let command = |name: &str, hint: Option<&str>| AgentCommand {
+            name: name.into(),
+            description: format!("agent {name}"),
+            hint: hint.map(str::to_owned),
+        };
+        let entries = menu(&[
+            command("status", None),
+            command("exit", None),
+            command("web", Some("query")),
+            command("compact", None),
+        ]);
+        let names = entries
             .iter()
-            .find(|entry| entry.command == self)
-            .expect("registered command")
-            .name
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "/model",
+                "/permissions",
+                "/new",
+                "/status",
+                "/quit",
+                "/web",
+                "/compact"
+            ]
+        );
+        assert_eq!(entries[3].description, "show session status");
+        assert_eq!(entries[5].description, "agent web (query)");
+        assert_eq!(entries[5].completion(), "/web ");
+        assert_eq!(entries[6].completion(), "/compact");
     }
 }
