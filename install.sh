@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="delegence/lazyagents"
+repo="ulughbeck/lazyagents"
 bin_name="lazyagents"
 version="${LAZYAGENTS_VERSION:-latest}"
 caller_dir="$(pwd -P)"

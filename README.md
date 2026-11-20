@@ -6,7 +6,7 @@ Describe its role, choose a harness, and start chatting.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ulughbeck/lazyagents/main/install.sh | sh
 ```
 
 ### Supported harnesses

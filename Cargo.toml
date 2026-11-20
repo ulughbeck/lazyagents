@@ -4,7 +4,7 @@ version = "0.2.2"
 edition = "2021"
 description = "Turn any folder into a local AI agent. Describe its role, choose harness, and start chatting."
 license = "MIT"
-repository = "https://github.com/delegence/lazyagents"
+repository = "https://github.com/ulughbeck/lazyagents"
 readme = "README.md"
 
 [dependencies]
